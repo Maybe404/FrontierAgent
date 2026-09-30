@@ -242,6 +242,18 @@ class TaskRunnerMixin:
         self.r.changes(stats)
 
     async def run_task(self, task: str) -> None:
+        from apodex.run_layout import run_dir
+        from frontier_agent.telemetry.scope import telemetry_run
+
+        async with telemetry_run(
+            run_dir=run_dir(self.session_id),
+            session_id=self.session_id,
+            task=task,
+            workflow=self.mode,
+        ):
+            await self._run_task(task)
+
+    async def _run_task(self, task: str) -> None:
         profile = get_profile(self.mode)
         if profile.workflow:
             await self._run_native_workflow(task, profile)

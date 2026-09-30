@@ -36,6 +36,7 @@ from frontier_agent.core.runtime.loop.model_profile import HistoryPolicy, ModelP
 from frontier_agent.core.runtime.loop.tool_call_parser import ToolCallParser
 from frontier_agent.core.runtime.loop.tool_exec import TOOL_EXECUTION_HOOKS
 from frontier_agent.core.tool import Tool
+from frontier_agent.telemetry.inject import with_telemetry
 
 __all__ = ["RUNTIME_HOOKS", "PauseCheckHook", "TurnCompleteHook", "run_agent_loop"]
 
@@ -106,7 +107,7 @@ async def run_agent_loop(
         llm=llm,
         tools=tools,
         config=cfg,
-        observers=observers,
+        observers=with_telemetry(observers),
         parser=parser,
         model_profile=model_profile,
         history_policy=history_policy,

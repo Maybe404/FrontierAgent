@@ -10,6 +10,7 @@ from agent_core.components.agent_bus.bus import PauseCheckFn
 
 from frontier_agent.core.protocols import EventSink
 from frontier_agent.core.runtime.registries import services as registry
+from frontier_agent.telemetry.inject import wrap_loop
 
 
 def _pause_check(task_id: str) -> PauseCheckFn:
@@ -37,4 +38,8 @@ _implementation.configure_default_pause_check_factory(_pause_check)
 _implementation.configure_default_event_sink_resolver(_event_sink)
 _implementation.configure_default_session_activity(True)
 _implementation.configure_default_runtime_hooks(_runtime_hooks)
+# Sub-agent loops are started inside the shared bus; wrap its loop entry so
+# they are journaled like the main agent (no-op without an active run).
+_loop_entry = "run_agent_loop"  # not re-exported by AgentCore; patched by name
+setattr(_implementation, _loop_entry, wrap_loop(getattr(_implementation, _loop_entry)))
 sys.modules[__name__] = _implementation
