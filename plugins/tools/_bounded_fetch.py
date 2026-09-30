@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import os
 
 import httpx
@@ -168,6 +169,14 @@ async def vet_public_url(url: str) -> tuple[str, tuple[str, ...]]:
         return str(exc), ()
     if isinstance(addresses, str):   # older single-address contract
         addresses = (addresses,)
+    # A local proxy's fake-IP answers only route by name, so pinning to them
+    # breaks TLS; let the client resolve through the proxy instead (opt-in).
+    from plugins.tools._download_runner import _local_fake_ip_networks
+    fake = _local_fake_ip_networks()
+    if fake and all(
+        any(ipaddress.ip_address(a) in net for net in fake) for a in addresses
+    ):
+        return "", ()
     return "", tuple(addresses)
 
 

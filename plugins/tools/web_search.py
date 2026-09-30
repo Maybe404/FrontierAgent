@@ -296,6 +296,11 @@ async def _do_web_search(
     tbs: str,
 ) -> dict:
     """Single Serper round-trip with retry. See :func:`raw_web_search`."""
+    from plugins.tools import _search_syncotech
+
+    if _search_syncotech.enabled():
+        return await _search_syncotech.search(query, num_results)
+
     config = get_config()
 
     if not config.serper_api_key:

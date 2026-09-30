@@ -24,6 +24,7 @@ from tenacity import (
 
 from frontier_agent.core.tool import tool
 from frontier_agent.infra.usage_meter import record_api_request
+from plugins.tools import _search_syncotech
 from plugins.tools.web_search import is_snippet_blocked_result
 
 logger = logging.getLogger(__name__)
@@ -192,6 +193,14 @@ async def _search_single_query(
     autocorrect: bool | None,
 ) -> list[dict]:
     """Run one Serper search; transparent quote-stripping retry on empty results."""
+    if _search_syncotech.enabled():
+        data = await _search_syncotech.search(query.strip(), num if num is not None else 10)
+        return [
+            item for item in data.get("organic", [])
+            if not _is_banned_url(item.get("link", ""))
+            and not is_snippet_blocked_result(item)
+        ]
+
     payload: dict[str, Any] = {"q": query.strip(), "gl": gl, "hl": hl}
     if location:
         payload["location"] = location
@@ -269,7 +278,7 @@ async def web_search_aligned(
     Returns:
         Numbered plain-text list of search results, each with Title, Snippet, and URL
     """
-    if not _serper_api_key():
+    if not _serper_api_key() and not _search_syncotech.enabled():
         return "[ERROR]: SERPER_API_KEY environment variable not set."
 
     # The reference tool accepts ``Union[str, List[str]]`` and tolerates JSON-encoded

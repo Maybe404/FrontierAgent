@@ -133,6 +133,19 @@ def _opener(ip: str) -> urllib.request.OpenerDirector:
     )
 
 
+def _local_fake_ip_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
+    """Opt-in ranges a local proxy's fake-IP DNS hands out (e.g. Surge/Clash
+    use 198.18.0.0/15). Off unless ``FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS`` is
+    set; never set it on servers, where these answers would be real hosts."""
+    raw = os.environ.get("FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS", "")
+    nets = []
+    for part in raw.split(","):
+        part = part.strip()
+        if part:
+            nets.append(ipaddress.ip_network(part, strict=False))
+    return tuple(nets)
+
+
 def _validate_public_url(url: str) -> tuple[str, ...]:
     """Vet *url* and return every public IP the request may be sent to.
 
@@ -162,9 +175,10 @@ def _validate_public_url(url: str) -> tuple[str, ...]:
     if not addresses:
         raise DownloadError(f"cannot resolve {parsed.hostname}")
     validated: list[tuple[int, str]] = []
+    allowed = _local_fake_ip_networks()
     for address in addresses:
         ip = ipaddress.ip_address(address)
-        if not ip.is_global:
+        if not ip.is_global and not any(ip in net for net in allowed):
             raise DownloadError(
                 f"refusing non-public address for {parsed.hostname}: {ip}",
             )
