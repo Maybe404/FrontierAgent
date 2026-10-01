@@ -205,8 +205,8 @@ class TelemetryRun:
     async def start(self, *, task: str, config: dict[str, Any] | None = None) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "run.lock").write_text(
-            to_json({"pid": os.getpid(), "run_id": self.run_id,
-                     "host": socket.gethostname(), "pid_started": _proc_start_marker()}),
+            to_json({"pid": os.getpid(), "run_id": self.run_id, "host": socket.gethostname(),
+                     "pid_started": await asyncio.to_thread(_proc_start_marker)}),
             encoding="utf-8",
         )
         self._heartbeat = asyncio.create_task(self._beat())
@@ -221,6 +221,12 @@ class TelemetryRun:
             "pid": os.getpid(),
             "env": {k: os.environ[k] for k in _ENV_KEYS if os.environ.get(k)},
         }, span_id=self.root_span_id)
+
+    def stop_heartbeat(self) -> None:
+        hb = getattr(self, "_heartbeat", None)
+        if hb is not None:
+            hb.cancel()
+            self._heartbeat = None
 
     async def _beat(self) -> None:
         """Keep the run.lock lease fresh; ``recover_stale`` treats a lease
@@ -280,9 +286,7 @@ class TelemetryRun:
             "telemetry_errors": self.errors,
             "lost_seqs": list(self.lost_seqs),
         }, span_id=self.root_span_id)
-        hb = getattr(self, "_heartbeat", None)
-        if hb is not None:
-            hb.cancel()
+        self.stop_heartbeat()
         with contextlib.suppress(OSError):
             (self.run_dir / "run.lock").unlink(missing_ok=True)
 
@@ -296,13 +300,24 @@ def _sha256_file(path: Path) -> str:
 
 
 def _proc_start_marker(pid: int | None = None) -> str:
-    """Process start time as reported by ps; distinguishes a reused pid."""
+    """Stable process start marker; distinguishes a reused pid.
+
+    Linux: start time in clock ticks from /proc (no locale, no time zone).
+    Elsewhere: ``ps lstart`` under a fixed locale and time zone, so the value
+    compares equal whoever runs the check. Empty when unavailable.
+    """
+    pid = pid or os.getpid()
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+        return "ticks:" + stat.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError):
+        pass
     import subprocess
 
     try:
-        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid or os.getpid())],
-                             capture_output=True, text=True, timeout=5)
-        return out.stdout.strip()
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True,
+                             timeout=5, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+        return "lstart:" + out.stdout.strip() if out.stdout.strip() else ""
     except (OSError, subprocess.SubprocessError):
         return ""
 

@@ -43,7 +43,12 @@ async def telemetry_run(
         logger.exception("telemetry: could not start run journal; continuing without it")
         yield None
         return
-    before = TelemetryRun.snapshot_outputs(Path(outputs_dir)) if outputs_dir is not None else None
+    before = None
+    if outputs_dir is not None:
+        try:
+            before = await asyncio.to_thread(TelemetryRun.snapshot_outputs, Path(outputs_dir))
+        except Exception as exc:     # never fail the task over a snapshot
+            run.note_failure("outputs snapshot", exc)
     token = current_run.set(run)
     status, error = "completed", ""
     exporter = _start_exporter(run)
@@ -59,9 +64,14 @@ async def telemetry_run(
         raise
     finally:
         current_run.reset(token)
+        # Stop renewing the lease first: if run.end below is interrupted, the
+        # lease must expire so the run can be recovered.
+        run.stop_heartbeat()
         if outputs_dir is not None:
-            with contextlib.suppress(Exception):
+            try:
                 await asyncio.shield(run.record_outputs(Path(outputs_dir), before))
+            except Exception as exc:
+                run.note_failure("record outputs", exc)
         with contextlib.suppress(Exception):
             await asyncio.shield(run.end(status=status, error=error))
         if exporter is not None:

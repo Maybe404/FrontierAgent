@@ -52,7 +52,11 @@ class TaskStore:
             have = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
             for col, typ in _MIGRATIONS.items():
                 if col not in have:
-                    con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
+                    try:
+                        con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
+                    except sqlite3.OperationalError as exc:   # another instance won the race
+                        if "duplicate column" not in str(exc):
+                            raise
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30)

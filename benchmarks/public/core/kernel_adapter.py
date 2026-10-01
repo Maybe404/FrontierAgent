@@ -157,6 +157,8 @@ class BenchmarkSession:
                 run.set_answer(str(state.get("final_answer") or state.get("final_content") or ""))
                 if state.get("stopped_by") == "llm_error":
                     run.set_outcome("failed", f"llm_error: {state.get('llm_error') or ''}")
+                elif not (state.get("final_answer") or state.get("final_content")):
+                    run.set_outcome("incomplete", f"no final answer; stopped_by={state.get('stopped_by')}")
             return state
 
     async def _run(

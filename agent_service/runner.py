@@ -8,13 +8,15 @@ is never rewritten.
 
 Failed and timed-out tasks carry an ``error_code`` the caller can branch on:
 ``llm_error``, ``incomplete``, ``agent_error``, ``worker_crashed``,
-``timeout``, ``service_restart``, ``internal``.
+``timeout``, ``cancelled``, ``service_shutdown``, ``service_restart``,
+``internal``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import logging
 import os
 import signal
@@ -29,6 +31,7 @@ from agent_service.store import TaskStore, now
 logger = logging.getLogger(__name__)
 
 _EXPORT_INTERVAL_S = 5.0
+_EXPORT_RETRY_S = 60.0
 
 
 class Runner:
@@ -39,26 +42,32 @@ class Runner:
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._terminations: dict[str, asyncio.Task[None]] = {}
+        self._stopping = False
+        # Workdirs whose final Langfuse export failed; retried by the sweeper.
+        self._export_backlog: set[Path] = set()
+        self._sweeper: asyncio.Task[None] | None = None
 
     # -- lifecycle --------------------------------------------------------------
 
     async def start(self) -> None:
         await self._recover_after_restart()
         self._workers = [asyncio.create_task(self._worker(i)) for i in range(self.cfg.max_concurrency)]
+        self._sweeper = asyncio.create_task(self._sweep_exports())
 
     async def stop(self) -> None:
-        """Stop accepting work and wait (bounded) for running workers to end."""
+        """Stop workers within ``shutdown_grace_s`` in total. Tasks stopped
+        here end ``cancelled``/``service_shutdown`` so callers can resubmit."""
+        self._stopping = True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.cfg.shutdown_grace_s
         for task_id in list(self._procs):
-            await self.cancel(task_id, reason="service shutdown")
-        pending = list(self._terminations.values())
-        if pending:
-            await asyncio.wait(pending, timeout=self.cfg.cancel_grace_s + 20)
-        # Let the per-task finish logic record the final states.
-        deadline = asyncio.get_running_loop().time() + 10
-        while self._procs and asyncio.get_running_loop().time() < deadline:
+            if self.store.transition(task_id, ("running",), "cancelling",
+                                     error="service shutdown", error_code="service_shutdown"):
+                self._start_termination(task_id, grace=max(1, self.cfg.shutdown_grace_s - 8))
+        while self._procs and loop.time() < deadline:
             await asyncio.sleep(0.1)
-        for w in self._workers:
-            w.cancel()
+        for t in (*self._workers, *([self._sweeper] if self._sweeper else [])):
+            t.cancel()
 
     async def _recover_after_restart(self) -> None:
         """Rows left running by a dead service are failed (their worker is
@@ -67,12 +76,20 @@ class Runner:
             if row["status"] in ("running", "cancelling"):
                 workdir = Path(row["workdir"])
                 pid = row.get("pid")
-                if pid and _is_our_worker(pid, workdir):
-                    await _kill_group_and_wait(pid)
+                if pid:
+                    owned = await asyncio.to_thread(_is_our_worker, pid, workdir)
+                    if owned:
+                        await _kill_group_and_wait(pid)
+                    elif owned is None:
+                        logger.warning("task %s: cannot verify pid %s (no /proc or ps); not signalling it",
+                                       row["id"], pid)
+                # A worker that outlived the old service may have finished the
+                # task; the journal decides before any forced status.
+                done = engine.read_result(workdir).status == "completed"
                 code = "cancelled" if row["status"] == "cancelling" else "service_restart"
-                await self._finish(row["id"], workdir, exit_code=None,
-                                   forced=("cancelled" if code == "cancelled" else "failed", code),
-                                   note="service restarted while task was running")
+                await self._finish(row["id"], workdir, exit_code=0 if done else None,
+                                   forced=None if done else ("cancelled" if code == "cancelled" else "failed", code),
+                                   note="" if done else "service restarted while task was running")
             elif row["status"] == "queued":
                 self._queue.put_nowait(row["id"])
 
@@ -89,10 +106,10 @@ class Runner:
             self._start_termination(task_id)
         return self.store.get(task_id)
 
-    def _start_termination(self, task_id: str) -> None:
+    def _start_termination(self, task_id: str, *, grace: float | None = None) -> None:
         proc = self._procs.get(task_id)
         if proc is not None and task_id not in self._terminations:
-            t = asyncio.create_task(self._terminate(proc))
+            t = asyncio.create_task(self._terminate(proc, grace=grace))
             self._terminations[task_id] = t
             t.add_done_callback(lambda _t, k=task_id: self._terminations.pop(k, None))
 
@@ -140,20 +157,25 @@ class Runner:
             try:
                 await asyncio.wait_for(proc.wait(), timeout=self.cfg.task_timeout_s)
             except TimeoutError:
-                timed_out = True
-                self.store.transition(task_id, ("running",), "cancelling",
-                                      error=f"timed out after {self.cfg.task_timeout_s}s", error_code="timeout")
-                await self._terminate(proc)
+                # Only a still-running task times out; one already being
+                # cancelled keeps its reason and its termination in progress.
+                timed_out = self.store.transition(
+                    task_id, ("running",), "cancelling",
+                    error=f"timed out after {self.cfg.task_timeout_s}s", error_code="timeout")
+                if timed_out:
+                    self._start_termination(task_id)
+                await proc.wait()
             finally:
                 exporter.cancel()
             await self._finish(task_id, workdir, exit_code=proc.returncode, timed_out=timed_out)
         finally:
             self._procs.pop(task_id, None)
 
-    async def _terminate(self, proc: asyncio.subprocess.Process) -> None:
+    async def _terminate(self, proc: asyncio.subprocess.Process, *, grace: float | None = None) -> None:
         """SIGINT (graceful: the CLI stops at a turn boundary and journals
         run.end), then SIGTERM, then SIGKILL of the whole process group."""
-        for sig, wait in ((signal.SIGINT, self.cfg.cancel_grace_s), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
+        first = self.cfg.cancel_grace_s if grace is None else grace
+        for sig, wait in ((signal.SIGINT, first), (signal.SIGTERM, 5), (signal.SIGKILL, 2)):
             if proc.returncode is not None:
                 return
             with contextlib.suppress(ProcessLookupError):
@@ -173,13 +195,21 @@ class Runner:
             await asyncio.sleep(_EXPORT_INTERVAL_S)
             await _export_once(workdir, exporters, final=False)
 
+    async def _sweep_exports(self) -> None:
+        """Retry final exports that failed (Langfuse down at task end)."""
+        while True:
+            await asyncio.sleep(_EXPORT_RETRY_S)
+            for workdir in list(self._export_backlog):
+                if await _export_once(workdir, {}, final=True):
+                    self._export_backlog.discard(workdir)
+
     async def _finish(self, task_id: str, workdir: Path, *, exit_code: int | None,
                       forced: tuple[str, str] | None = None, timed_out: bool = False,
                       note: str = "") -> None:
         await engine.recover(workdir)            # crashed worker -> synthetic run.end
         result = engine.read_result(workdir)
-        with contextlib.suppress(Exception):
-            await _export_once(workdir, {}, final=True)
+        if not await _export_once(workdir, {}, final=True):
+            self._export_backlog.add(workdir)
         row = self.store.get(task_id) or {}
         status, code = _classify(result, exit_code, row, forced=forced, timed_out=timed_out)
         error = None
@@ -215,34 +245,65 @@ def _classify(result: engine.RunResult, exit_code: int | None, row: dict[str, An
     return "failed", "agent_error"
 
 
-async def _export_once(workdir: Path, exporters: dict[str, Any], *, final: bool) -> None:
+async def _export_once(workdir: Path, exporters: dict[str, Any], *, final: bool) -> bool:
+    """Export every run under *workdir*; False if anything is still pending."""
     from frontier_agent.telemetry import langfuse_export as lf
 
     if not lf.configured():
-        return
-    for rd, session_id, run_id in await asyncio.to_thread(engine.session_ids, workdir):
+        return True
+    ok = True
+    try:
+        runs = await asyncio.to_thread(engine.session_ids, workdir)
+    except Exception as exc:
+        logger.warning("Langfuse export: cannot list runs in %s: %s", workdir, exc)
+        return False
+    for rd, session_id, run_id in runs:
         ex = exporters.setdefault(run_id, lf.Exporter(rd, session_id, run_id))
         try:
             await ex.step(final=final, wait_lock=final)
+            ok = ok and not ex.pending
         except Exception as exc:
+            ok = False
             logger.warning("Langfuse export for %s deferred: %s", run_id, exc)
+    return ok
 
 
-def _is_our_worker(pid: int, workdir: Path) -> bool:
-    """True only if *pid* is alive and its command line names this task's
-    workdir, so a reused pid is never signalled."""
+def _cmdline(pid: int) -> list[str] | None:
+    """Argument vector of *pid*: /proc on Linux, else ``ps -ww``.
+    ``[]`` when the process is gone, ``None`` when it cannot be determined."""
+    proc = Path(f"/proc/{pid}/cmdline")
+    if Path("/proc/self/cmdline").exists():
+        try:
+            return [a for a in proc.read_bytes().decode(errors="replace").split("\0") if a]
+        except OSError:
+            return []
     try:
-        out = subprocess.run(["ps", "-o", "command=", "-p", str(pid)],
+        out = subprocess.run(["ps", "-ww", "-o", "command=", "-p", str(pid)],
                              capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
-        return False
-    return out.returncode == 0 and str(workdir) in out.stdout
+        return None
+    return out.stdout.split() if out.returncode == 0 else []
+
+
+def _is_our_worker(pid: int, workdir: Path) -> bool | None:
+    """True only if *pid* is a worker started for *workdir* (its ``--cwd``
+    argument equals it exactly), so a reused pid is never signalled.
+    ``None`` when identity cannot be verified on this host."""
+    argv = _cmdline(pid)
+    if argv is None:
+        return None
+    target = str(workdir)
+    return any(a == "--cwd" and b == target for a, b in itertools.pairwise(argv))
 
 
 async def _kill_group_and_wait(pid: int) -> None:
     for sig in (signal.SIGTERM, signal.SIGKILL):
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(pid, sig)          # workers lead their own session/group
+            # Workers lead their own group; anything else gets a plain kill.
+            if os.getpgid(pid) == pid:
+                os.killpg(pid, sig)
+            else:
+                os.kill(pid, sig)
         for _ in range(50):
             if not _alive(pid):
                 return

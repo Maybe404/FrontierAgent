@@ -244,8 +244,9 @@ _guard_hooks(TelemetryObserver)
 
 
 class ToolResultTail(BaseObserver):
-    """Runs after every other observer: journals the tool result exactly as
-    the model will see it, when another observer reshaped it."""
+    """Runs after every other observer: journals the tool result as the
+    observers left it, when one of them reshaped it. A loop-level cap
+    (``tool_result_max_chars``) applied later is not reflected here."""
 
     critical = True
 

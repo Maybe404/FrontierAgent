@@ -177,7 +177,7 @@ def test_timeout_is_reported_as_timed_out(tmp_path: Path, monkeypatch) -> None:
                         lambda *, task, mode, workdir, max_turns: [sys.executable, str(script), str(workdir), task])
     cfg = ServiceConfig(data_dir=tmp_path / "svc", api_token="", max_concurrency=1,
                         task_timeout_s=2, cancel_grace_s=5, default_mode="react", max_task_chars=1000)
-    with TestClient(create_app(cfg)) as c:
+    with TestClient(create_app(cfg, allow_no_auth=True)) as c:
         task_id = c.post("/v1/tasks", json={"task": "sleep long"}).json()["id"]
         row = _wait(c, task_id)
     assert row["status"] == "timed_out" and row["error_code"] == "timeout"
@@ -204,3 +204,59 @@ def test_restart_never_signals_a_process_that_is_not_our_worker(tmp_path: Path) 
     from agent_service.runner import _is_our_worker
 
     assert _is_our_worker(os.getpid(), tmp_path / "not-in-my-cmdline") is False
+
+
+def test_worker_process_does_not_reload_a_parent_dotenv(tmp_path: Path) -> None:
+    """The allowlist must hold inside the real worker: the CLI's .env loader
+    walks up from the task dir, so put a poisoned .env above it."""
+    import subprocess
+
+    (tmp_path / ".env").write_text("SERVICE_API_TOKEN=leaked\nLANGFUSE_SECRET_KEY=leaked\n")
+    workdir = tmp_path / "tasks" / "t1"
+    workdir.mkdir(parents=True)
+    env = engine.build_env(task_id="t1", request_id="r", source=dict(os.environ))
+    probe = ("import json, os; from apodex.userenv import load_environment; load_environment(); "
+             "print(json.dumps({k: os.environ.get(k) for k in ('SERVICE_API_TOKEN', 'LANGFUSE_SECRET_KEY')}))")
+    out = subprocess.run([sys.executable, "-c", probe], cwd=workdir, env=env,
+                         capture_output=True, text=True, timeout=60, check=True)
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == {
+        "SERVICE_API_TOKEN": None, "LANGFUSE_SECRET_KEY": None}
+
+
+def test_create_app_refuses_without_token_unless_allowed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_ALLOW_NO_AUTH", raising=False)
+    cfg = ServiceConfig(data_dir=tmp_path, api_token="", max_concurrency=1, task_timeout_s=10,
+                        cancel_grace_s=1, default_mode="react", max_task_chars=10)
+    with pytest.raises(RuntimeError):
+        create_app(cfg)
+    create_app(cfg, allow_no_auth=True)
+    # An app factory does not know its bind address: no fake-IP passthrough.
+    monkeypatch.setenv("SERVICE_ALLOW_FAKE_IP", "1")
+    assert ServiceConfig.from_env().allow_fake_ip is False
+
+
+def test_is_our_worker_recognises_a_real_worker(tmp_path: Path) -> None:
+    import subprocess
+
+    from agent_service.runner import _is_our_worker
+
+    workdir = tmp_path / "tasks" / "abc"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--cwd", str(workdir)])
+    try:
+        time.sleep(0.3)
+        assert _is_our_worker(proc.pid, workdir) is True
+        assert _is_our_worker(proc.pid, tmp_path / "tasks" / "ab") is False   # no prefix match
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_restart_keeps_a_task_the_worker_finished(tmp_path: Path, client) -> None:
+    import asyncio
+
+    task_id = client.post("/v1/tasks", json={"task": "done before restart"}).json()["id"]
+    _wait(client, task_id)
+    store = client.app.state.store
+    store.update(task_id, status="running", pid=2 ** 22 + 99, error_code=None)   # service died mid-task
+    asyncio.run(client.app.state.runner._recover_after_restart())
+    assert store.get(task_id)["status"] == "completed"

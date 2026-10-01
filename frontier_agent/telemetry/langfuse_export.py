@@ -23,8 +23,9 @@ import json
 import logging
 import os
 import sqlite3
+import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -40,6 +41,8 @@ _BATCH = 200
 # Langfuse caps field sizes; the full value always stays in the local blob.
 _FIELD_CAP = 200_000
 _LIVE_INTERVAL_S = 2.0
+# How long an unconfirmed in-flight span waits before it is resent.
+INFLIGHT_GRACE_S = 120.0
 _SHOW_LAST_MESSAGES = 8
 
 
@@ -121,19 +124,21 @@ def _load_state(run_dir: Path) -> dict[str, Any]:
         return {}
 
 
-def load_state(run_dir: Path, run_id: str) -> tuple[set[str], dict[str, str]]:
-    """``(sent span keys, in-flight span key -> span id)`` for one run."""
+def load_state(run_dir: Path, run_id: str) -> tuple[set[str], dict[str, list[Any]]]:
+    """``(sent span keys, in-flight span key -> [span id, first sent at])``."""
     entry = _load_state(run_dir).get(run_id, {})
     if isinstance(entry, list):                # pre-inflight format
         return set(entry), {}
-    return set(entry.get("sent", [])), dict(entry.get("inflight", {}))
+    inflight = {k: (v if isinstance(v, list) else [v, 0.0])
+                for k, v in dict(entry.get("inflight", {})).items()}
+    return set(entry.get("sent", [])), inflight
 
 
 def load_sent(run_dir: Path, run_id: str) -> set[str]:
     return load_state(run_dir, run_id)[0]
 
 
-def save_state(run_dir: Path, run_id: str, sent: set[str], inflight: dict[str, str]) -> None:
+def save_state(run_dir: Path, run_id: str, sent: set[str], inflight: dict[str, list[Any]]) -> None:
     """Atomic write; callers hold the run directory's export lock."""
     path = _state_path(run_dir)
     data = _load_state(run_dir)
@@ -143,14 +148,18 @@ def save_state(run_dir: Path, run_id: str, sent: set[str], inflight: dict[str, s
     os.replace(tmp, path)
 
 
-@contextlib.contextmanager
-def export_lock(run_dir: Path, *, wait: bool) -> Iterator[bool]:
+@contextlib.asynccontextmanager
+async def export_lock(run_dir: Path, *, wait: bool) -> AsyncIterator[bool]:
     """Exclusive per-run-directory lock so live and manual exports never
-    send the same spans concurrently. Yields False when busy and not waiting."""
+    send the same spans concurrently. Yields False when busy and not waiting.
+    A blocking wait runs in a thread so the event loop keeps serving."""
     fh = (run_dir / "export.lock").open("a")
     try:
         try:
-            fcntl.flock(fh, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            if wait:
+                await asyncio.to_thread(fcntl.flock, fh, fcntl.LOCK_EX)
+            else:
+                fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             yield False
             return
@@ -175,6 +184,9 @@ class _Span:
     attrs: dict[str, Any] = field(default_factory=dict[str, Any])
     error: str = ""
     level: str = ""
+    # Ended but held back until its agent moves on, so late additions
+    # (tool.result.final from the tail observer) make it into the span.
+    hold: bool = False
 
 
 class SpanBuilder:
@@ -199,6 +211,8 @@ class SpanBuilder:
         for s in self.spans.values():
             if s.key in sent:
                 continue
+            if s.hold and not (final or self.ended):
+                continue
             if not s.end and (final or self.ended):
                 s.end = self.last_ts
                 s.level = "WARNING"
@@ -214,6 +228,11 @@ class SpanBuilder:
             self.ended = True
         kind, d, ts = e["kind"], e.get("data") or {}, e["ts"]
         span, parent, turn = str(e.get("span_id") or ""), e.get("parent_span_id"), e.get("turn")
+        if not kind.startswith("tool."):
+            # The agent moved on: its finished tool spans are complete.
+            for t in spans.values():
+                if t.hold and t.parent == span:
+                    t.hold = False
         meta = {f"{obs}metadata.agent_id": e.get("agent_id") or ""}
 
         if kind == "run.start":
@@ -306,6 +325,7 @@ class SpanBuilder:
                                          attrs={f"{obs}type": "tool", **meta})
             spans[key] = s
             s.end = ts
+            s.hold = True
             s.attrs[f"{obs}output"] = _js(_resolve(run_dir, d.get("result")) or "")
             s.attrs[f"{obs}metadata.duration_ms"] = str(d.get("duration_ms", ""))
             if d.get("is_error"):
@@ -405,14 +425,17 @@ class Exporter:
     """Incremental exporter for one run: reads only new journal entries.
 
     Spans are recorded as in-flight before each POST; after a lost response
-    the next round asks Langfuse which of them arrived and resends only the
-    rest (Langfuse v4 keeps duplicates, so blind resends are not safe).
+    the next rounds ask Langfuse which of them arrived. Langfuse ingests
+    asynchronously, so an unconfirmed span is only resent after
+    ``INFLIGHT_GRACE_S`` (Langfuse v4 keeps duplicates); a failing check never
+    blocks the rest of the export.
     """
 
     def __init__(self, run_dir: Path, session_id: str, run_id: str) -> None:
         self.run_dir, self.session_id, self.run_id = run_dir, session_id, run_id
         self.builder = SpanBuilder(run_dir)
         self.cursor = 0
+        self.pending = False        # spans awaiting confirmation remain
 
     def _advance(self) -> None:
         entries = read_entries(self.run_dir, self.session_id, self.run_id, self.cursor)
@@ -422,27 +445,46 @@ class Exporter:
 
     async def step(self, *, final: bool = False, wait_lock: bool = False, resend: bool = False) -> int:
         """Send what is ready. Returns spans sent (0 when another export holds the lock)."""
-        with export_lock(self.run_dir, wait=wait_lock) as locked:
+        async with export_lock(self.run_dir, wait=wait_lock) as locked:
             if not locked:
                 return 0
             await asyncio.to_thread(self._advance)
             sent, inflight = (set(), {}) if resend else load_state(self.run_dir, self.run_id)
+            now = time.time()
             async with _client() as client:
                 if inflight:
-                    arrived = await _existing_ids(client, self.builder.trace_id)
-                    sent.update(k for k, sid in inflight.items() if sid in arrived)
-                    inflight = {}
+                    inflight = await self._reconcile(client, sent, inflight, now)
                     save_state(self.run_dir, self.run_id, sent, inflight)
-                todo = self.builder.take(sent, final=final)
+                todo = self.builder.take(sent | set(inflight), final=final)
                 for i in range(0, len(todo), _BATCH):
                     chunk = todo[i:i + _BATCH]
-                    inflight = {s.key: s.span_id for s in chunk}
+                    batch = {s.key: [s.span_id, now] for s in chunk}
+                    inflight.update(batch)
                     save_state(self.run_dir, self.run_id, sent, inflight)
                     await _post(client, self.builder.trace_id, chunk)
-                    sent.update(inflight)
-                    inflight = {}
+                    sent.update(batch)
+                    for k in batch:
+                        inflight.pop(k, None)
                     save_state(self.run_dir, self.run_id, sent, inflight)
+            self.pending = bool(inflight)
             return len(todo)
+
+    async def _reconcile(self, client: httpx.AsyncClient, sent: set[str],
+                         inflight: dict[str, list[Any]], now: float) -> dict[str, list[Any]]:
+        """Confirmed spans move to *sent*; unconfirmed ones wait out the grace
+        period, then are dropped from in-flight so they are resent."""
+        try:
+            arrived: set[str] | None = await _existing_ids(client, self.builder.trace_id)
+        except Exception as exc:
+            logger.warning("telemetry: in-flight check for %s failed: %s", self.run_id, exc)
+            arrived = None
+        keep: dict[str, list[Any]] = {}
+        for key, (span_id, first) in inflight.items():
+            if arrived is not None and span_id in arrived:
+                sent.add(key)
+            elif now - float(first or 0) < INFLIGHT_GRACE_S * (1 if arrived is not None else 5):
+                keep[key] = [span_id, first]
+        return keep
 
 
 async def _existing_ids(client: httpx.AsyncClient, trace_id: str) -> set[str]:
