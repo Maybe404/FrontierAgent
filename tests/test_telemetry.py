@@ -134,7 +134,7 @@ async def test_intervention_recorder_journals_interventions(tmp_path: Path) -> N
             return Intervention(stop_reason="loop detected")
 
     async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t"):
-        _, wrapped = with_telemetry([Guard()])
+        _, wrapped, _tail = with_telemetry([Guard()])
         assert isinstance(wrapped, InterventionRecorder)
         assert wrapped.marker == "kept" and wrapped.critical is True
         rv = await wrapped.on_turn_end(_ctx(turn=3))
@@ -224,10 +224,11 @@ async def test_live_lock_is_left_alone(tmp_path: Path) -> None:
 async def test_deliverables_and_final_answer_are_journaled(tmp_path: Path) -> None:
     outputs = tmp_path / "outputs"
     (outputs / "sub").mkdir(parents=True)
-    (outputs / "report.md").write_text("# 报告\n结论", encoding="utf-8")
-    (outputs / "sub" / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+    (outputs / "old.txt").write_text("from an earlier run", encoding="utf-8")
 
     async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t", outputs_dir=outputs) as run:
+        (outputs / "report.md").write_text("# 报告\n结论", encoding="utf-8")
+        (outputs / "sub" / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
         obs = with_telemetry([])[0]
         await obs.on_loop_start(LoopConfig(role_id="main"))
         await obs.on_loop_end(AgentLoopResult(messages=[], final_content="最终答案", stopped_by="no_tool"))
@@ -341,3 +342,78 @@ async def test_benchmark_session_journals_into_trial_dir(tmp_path: Path, monkeyp
 
     # Without a trial dir (and no open run) nothing is journaled.
     assert await session.run("q?", meta={}, pipeline_id="x") == {"final_answer": "42"}
+
+
+async def test_reported_outcome_and_answer_win_over_defaults(tmp_path: Path) -> None:
+    async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t") as run:
+        obs = with_telemetry([])[0]
+        await obs.on_loop_start(LoopConfig(role_id="main"))
+        await obs.on_loop_end(AgentLoopResult(messages=[], final_content="loop text", stopped_by="llm_error"))
+        run.set_answer("workflow answer")
+        run.set_outcome("failed", "llm_error: 503")
+    end = _entries(run)[-1]["data"]
+    assert end["status"] == "failed" and end["error"] == "llm_error: 503"
+    assert end["output"] == "workflow answer"
+
+
+async def test_hook_failure_is_counted_not_raised(tmp_path: Path, monkeypatch) -> None:
+    async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t") as run:
+        obs = with_telemetry([])[0]
+
+        async def broken_put(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(run, "put_blob", broken_put)
+        await obs.on_llm_input(_ctx())              # must not raise
+    end = _entries(run)[-1]["data"]
+    assert end["complete"] is False and end["telemetry_errors"] == 1
+
+
+async def test_lease_decides_for_other_hosts(tmp_path: Path) -> None:
+    import os
+
+    from frontier_agent.telemetry.run import LEASE_TIMEOUT_S, recover_stale
+
+    run = await _one_turn_run(tmp_path, finish=False)
+    lock = tmp_path / "run.lock"
+    info = json.loads(lock.read_text())
+    info["host"] = "another-pod"
+    lock.write_text(json.dumps(info))
+    assert await recover_stale(tmp_path) is None          # fresh lease: still owned
+    old = lock.stat().st_mtime - LEASE_TIMEOUT_S - 5
+    os.utime(lock, (old, old))
+    assert await recover_stale(tmp_path) == run.run_id    # lease expired
+
+
+async def test_reused_pid_is_not_mistaken_for_the_owner(tmp_path: Path) -> None:
+    from frontier_agent.telemetry.run import recover_stale
+
+    run = await _one_turn_run(tmp_path, finish=False)
+    lock = tmp_path / "run.lock"
+    info = json.loads(lock.read_text())
+    info["pid_started"] = "Thu Jan  1 00:00:00 1970"      # our pid, different process
+    lock.write_text(json.dumps(info))
+    assert await recover_stale(tmp_path) == run.run_id
+
+
+async def test_tail_records_tool_result_as_the_model_sees_it(tmp_path: Path) -> None:
+    class Truncator:
+        critical = True
+
+        async def on_tool_result(self, ctx, result):
+            result.result = result.result[:3]
+            return result
+
+    async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t") as run:
+        head, trunc, tail = with_telemetry([Truncator()])
+        await head.on_loop_start(LoopConfig(role_id="main"))
+        tr = ToolResult(name="web_fetch", args={}, result="abcdef", duration_ms=1,
+                        tool_call_id="c1", is_error=False)
+        for o in (head, trunc, tail):            # the loop's dispatch order
+            await o.on_tool_result(_ctx(), tr)
+    kinds = {e["kind"]: e["data"] for e in _entries(run)}
+    assert kinds["tool.result"]["result"] == "abcdef"
+    assert kinds["tool.result.final"]["result"] == "abc"
+    _, spans = lf.build_spans(tmp_path, _entries(run), final=True)
+    tool = next(s for s in spans if s.name == "tool:web_fetch")
+    assert tool.attrs["langfuse.observation.output"] == "abc"

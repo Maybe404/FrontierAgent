@@ -578,7 +578,10 @@ async def _amain(argv: list[str] | None = None) -> int:
             print("error: -p/--print requires a TASK argument", file=sys.stderr)
             return 2
         await session.run_task(args.task)
-        return 0
+        # Non-zero when the task did not complete, so callers (agent_service,
+        # scripts) see failures without parsing output.
+        status = getattr(session, "last_outcome", ("completed", ""))[0]
+        return {"completed": 0, "cancelled": 130}.get(status, 1)
 
     if args.task:
         # Run the given task once, then drop into the REPL for follow-ups.

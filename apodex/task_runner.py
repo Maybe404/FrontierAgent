@@ -143,6 +143,8 @@ class TaskRunnerMixin:
         journal: WorkspaceJournal
         tracer: TraceObserver
         session_id: str
+        last_outcome: tuple[str, str]
+        last_answer: str
         llm: LLMClient
         history: list[Message]
         display_history: list[Message]
@@ -245,14 +247,25 @@ class TaskRunnerMixin:
         from apodex.run_layout import run_dir
         from frontier_agent.telemetry.scope import telemetry_run
 
+        # Nested run_task calls (steering, compaction resume) join the outer
+        # run, and the latest outcome is the run's outcome.
+        self.last_outcome = ("completed", "")
+        self.last_answer = ""
         async with telemetry_run(
             run_dir=run_dir(self.session_id),
             session_id=self.session_id,
             task=task,
             workflow=self.mode,
             outputs_dir=run_dir(self.session_id) / "outputs",
-        ):
+        ) as run:
             await self._run_task(task)
+            if run is not None:
+                run.set_outcome(*self.last_outcome)
+                run.set_answer(self.last_answer)
+
+    def _outcome(self, status: str, error: str = "") -> None:
+        """Record how the task really ended; ``run_task`` reports it."""
+        self.last_outcome = (status, error)
 
     async def _run_task(self, task: str) -> None:
         profile = get_profile(self.mode)
@@ -354,8 +367,10 @@ class TaskRunnerMixin:
             )
         except KeyboardInterrupt:
             status = "interrupted"  # partial output stays in the scrollback
+            self._outcome("cancelled", "interrupted")
         except LLMError as exc:  # a genuine LLM/provider failure escaped the loop
             status = "error"
+            self._outcome("failed", f"LLMError: {exc}")
             # Type-checked: an LLMError IS an LLM failure (no string-sniffing to
             # decide). Show the provider's own message (last_exc) — it's already
             # actionable — tagged with the short reason.
@@ -366,6 +381,7 @@ class TaskRunnerMixin:
                          else f"✗ LLM call failed:\n  {detail}")
         except Exception as exc:  # never let one task kill the REPL
             status = "error"
+            self._outcome("failed", f"{type(exc).__name__}: {exc}")
             # Not an LLMError → a tool bug / loop bug. Stay generic so it isn't
             # mislabeled an LLM failure.
             self.r.error(f"agent loop failed: {exc}")
@@ -395,6 +411,7 @@ class TaskRunnerMixin:
                 await self.run_task("")  # resume on the compacted history
                 return
             if result.stopped_by == "user_rejected":
+                self._outcome("failed", "user rejected an action")
                 # User declined an action → stop cleanly and hand control back
                 # (don't force a summary answer; that would just keep talking).
                 self.r.note(
@@ -407,6 +424,7 @@ class TaskRunnerMixin:
                 # (its rescue LLM call would just hit the same failure).
                 detail = str(result.metadata.get("llm_error") or "").strip()
                 reason = str(result.metadata.get("llm_error_reason") or "").strip()
+                self._outcome("failed", f"llm_error: {reason} {detail}".strip())
                 # Unlike the workflows, this path has no deterministic fallback
                 # prose: a non-empty final_content here is text the model really
                 # produced before the endpoint died, so it is worth keeping.
@@ -415,11 +433,14 @@ class TaskRunnerMixin:
                 )
             else:
                 final = await self._force_final(result)
+                self.last_answer = str(final or "")
                 # ``no_tool_behavior="stop"`` above: a plain-text turn is this
                 # loop's normal finish, not a truncation.
                 complete = _is_complete_run(
                     result.stopped_by, no_tool_is_complete=True,
                 )
+                if not complete:
+                    self._outcome("incomplete", f"stopped_by={result.stopped_by}")
                 render = self.r.final if complete else None
                 if render is not None:
                     render(
@@ -537,8 +558,10 @@ class TaskRunnerMixin:
                 )
         except KeyboardInterrupt:
             status = "interrupted"
+            self._outcome("cancelled", "interrupted")
         except Exception as exc:
             status = "error"
+            self._outcome("failed", f"{profile.workflow} workflow failed: {type(exc).__name__}: {exc}")
             self.r.error(f"{profile.workflow} workflow failed: {exc}")
         finally:
             inbox.detach()
@@ -564,6 +587,8 @@ class TaskRunnerMixin:
             final = "(the workflow finished without a final answer)"
         stopped_by = str(state.get("stopped_by") or "workflow_complete")
         if stopped_by == "llm_error":
+            self._outcome("failed", "llm_error: {} {}".format(
+                state.get("llm_error_reason") or "", state.get("llm_error") or "").strip())
             # ``answer_status`` (see stateful_react_agent/nodes/main_agent.py)
             # separates the workflow's deterministic placeholder prose
             # (``not_found``) from an answer its salvage call really recovered
@@ -599,6 +624,9 @@ class TaskRunnerMixin:
             if "tool_calls_count" in state
             else 0
         )
+        self.last_answer = final
+        if not complete:
+            self._outcome("incomplete", f"stopped_by={stopped_by}; answer_status={state.get('answer_status') or ''}")
         if complete:
             self.r.final(
                 final,

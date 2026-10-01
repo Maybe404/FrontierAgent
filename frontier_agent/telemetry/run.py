@@ -35,6 +35,8 @@ SCHEMA = "fa.event/v1"
 # Strings longer than this move out of the row into a blob.
 INLINE_LIMIT = 8 * 1024
 _WRITE_ATTEMPTS = 3
+HEARTBEAT_S = 10.0
+LEASE_TIMEOUT_S = 120.0
 # Deliverables up to this size are copied into the journal's blob store.
 DELIVERABLE_BLOB_LIMIT = 50 * 1024 * 1024
 
@@ -101,8 +103,22 @@ class TelemetryRun:
         self.errors = 0
         # Set by the top-level agent's loop.end; reported on run.end.
         self.final_output = ""
+        # True once the caller reported the answer itself (workflow state),
+        # which then wins over the last top-level loop's final content.
+        self.answer_explicit = False
+        # Caller-reported outcome (status, error); wins over "completed" when
+        # the block exits normally but the task did not succeed.
+        self.outcome: tuple[str, str] | None = None
         self.lost_seqs: list[int] = []
         self._started_mono = time.monotonic()
+
+    def set_outcome(self, status: str, error: str = "") -> None:
+        self.outcome = (status, error)
+
+    def set_answer(self, text: str) -> None:
+        if text:
+            self.final_output = text
+            self.answer_explicit = True
 
     # -- writing ------------------------------------------------------------
 
@@ -178,15 +194,22 @@ class TelemetryRun:
         self.lost_seqs.append(seq)
         logger.error("telemetry: lost event seq=%d kind=%s: %s", seq, kind, exc)
 
+    def note_failure(self, where: str, exc: BaseException) -> None:
+        """A telemetry step failed outside ``emit`` (e.g. a blob write): the
+        run is reported incomplete even though no sequence number was lost."""
+        self.errors += 1
+        logger.error("telemetry: %s failed: %s", where, exc)
+
     # -- lifecycle ----------------------------------------------------------
 
     async def start(self, *, task: str, config: dict[str, Any] | None = None) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "run.lock").write_text(
             to_json({"pid": os.getpid(), "run_id": self.run_id,
-                     "host": socket.gethostname()}),
+                     "host": socket.gethostname(), "pid_started": _proc_start_marker()}),
             encoding="utf-8",
         )
+        self._heartbeat = asyncio.create_task(self._beat())
         await self.emit("run.start", {
             "session_id": self.session_id,
             "run_id": self.run_id,
@@ -199,19 +222,43 @@ class TelemetryRun:
             "env": {k: os.environ[k] for k in _ENV_KEYS if os.environ.get(k)},
         }, span_id=self.root_span_id)
 
-    async def record_outputs(self, outputs_dir: Path) -> None:
-        """Journal every deliverable file: name, size, hash and content."""
+    async def _beat(self) -> None:
+        """Keep the run.lock lease fresh; ``recover_stale`` treats a lease
+        silent for LEASE_TIMEOUT_S as abandoned."""
+        lock = self.run_dir / "run.lock"
+        while True:
+            await asyncio.sleep(HEARTBEAT_S)
+            with contextlib.suppress(OSError):
+                os.utime(lock)
+
+    @staticmethod
+    def snapshot_outputs(outputs_dir: Path) -> dict[str, tuple[int, int]]:
+        """``{relative path: (size, mtime_ns)}`` of the files present now."""
         if not outputs_dir.is_dir():
-            return
-        for path in sorted(p for p in outputs_dir.rglob("*") if p.is_file()):
-            rel = str(path.relative_to(outputs_dir))
+            return {}
+        out = {}
+        for p in outputs_dir.rglob("*"):
+            if p.is_file():
+                st = p.stat()
+                out[str(p.relative_to(outputs_dir))] = (st.st_size, st.st_mtime_ns)
+        return out
+
+    async def record_outputs(self, outputs_dir: Path,
+                             before: dict[str, tuple[int, int]] | None = None) -> None:
+        """Journal deliverables: files new or changed since *before*."""
+        now = await asyncio.to_thread(self.snapshot_outputs, outputs_dir)
+        for rel in sorted(now):
+            if before is not None and before.get(rel) == now[rel]:
+                continue
+            path = outputs_dir / rel
             try:
-                size = path.stat().st_size
+                size = now[rel][0]
                 info: dict[str, Any] = {"path": rel, "bytes": size,
                                         "media_type": mimetypes.guess_type(rel)[0] or ""}
                 refs: dict[str, BlobRef] = {}
                 if size <= DELIVERABLE_BLOB_LIMIT:
-                    ref = await self.put_blob(path.read_bytes(), info["media_type"] or "application/octet-stream")
+                    data = await asyncio.to_thread(path.read_bytes)
+                    ref = await self.put_blob(data, info["media_type"] or "application/octet-stream")
                     refs["content"] = ref
                     info["sha256"] = ref.digest
                 else:
@@ -233,6 +280,9 @@ class TelemetryRun:
             "telemetry_errors": self.errors,
             "lost_seqs": list(self.lost_seqs),
         }, span_id=self.root_span_id)
+        hb = getattr(self, "_heartbeat", None)
+        if hb is not None:
+            hb.cancel()
         with contextlib.suppress(OSError):
             (self.run_dir / "run.lock").unlink(missing_ok=True)
 
@@ -243,6 +293,24 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: fh.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def _proc_start_marker(pid: int | None = None) -> str:
+    """Process start time as reported by ps; distinguishes a reused pid."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid or os.getpid())],
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return ""
+
+
+def _same_process_alive(pid: int, started: str | None) -> bool:
+    if not pid or not _pid_alive(pid):
+        return False
+    return not started or _proc_start_marker(pid) == started
 
 
 def _pid_alive(pid: int) -> bool:
@@ -265,9 +333,14 @@ async def recover_stale(run_dir: Path) -> str | None:
     lock = run_dir / "run.lock"
     try:
         info = json.loads(lock.read_text(encoding="utf-8"))
+        age = time.time() - lock.stat().st_mtime
     except (OSError, ValueError):
         return None
-    if info.get("host") == socket.gethostname() and _pid_alive(int(info.get("pid", 0))):
+    same_host = info.get("host") == socket.gethostname()
+    owner_dead = same_host and not _same_process_alive(
+        int(info.get("pid", 0)), info.get("pid_started"))
+    # Other hosts (shared volume) are judged only by the heartbeat lease.
+    if not owner_dead and age < LEASE_TIMEOUT_S:
         return None
     run_id = str(info.get("run_id") or "")
     db = run_dir / "journal.db"

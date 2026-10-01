@@ -17,11 +17,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fcntl
 import hashlib
 import json
 import logging
 import os
 import sqlite3
+import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -111,23 +114,52 @@ def _state_path(run_dir: Path) -> Path:
     return run_dir / "export.state"
 
 
+def _load_state(run_dir: Path) -> dict[str, Any]:
+    try:
+        return json.loads(_state_path(run_dir).read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def load_state(run_dir: Path, run_id: str) -> tuple[set[str], dict[str, str]]:
+    """``(sent span keys, in-flight span key -> span id)`` for one run."""
+    entry = _load_state(run_dir).get(run_id, {})
+    if isinstance(entry, list):                # pre-inflight format
+        return set(entry), {}
+    return set(entry.get("sent", [])), dict(entry.get("inflight", {}))
+
+
 def load_sent(run_dir: Path, run_id: str) -> set[str]:
-    try:
-        return set(json.loads(_state_path(run_dir).read_text()).get(run_id, []))
-    except (OSError, ValueError):
-        return set()
+    return load_state(run_dir, run_id)[0]
 
 
-def save_sent(run_dir: Path, run_id: str, keys: set[str]) -> None:
+def save_state(run_dir: Path, run_id: str, sent: set[str], inflight: dict[str, str]) -> None:
+    """Atomic write; callers hold the run directory's export lock."""
     path = _state_path(run_dir)
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        data = {}
-    data[run_id] = sorted(keys)
-    tmp = path.with_suffix(".tmp")
+    data = _load_state(run_dir)
+    data[run_id] = {"sent": sorted(sent), "inflight": inflight}
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp")
     tmp.write_text(json.dumps(data))
     os.replace(tmp, path)
+
+
+@contextlib.contextmanager
+def export_lock(run_dir: Path, *, wait: bool) -> Iterator[bool]:
+    """Exclusive per-run-directory lock so live and manual exports never
+    send the same spans concurrently. Yields False when busy and not waiting."""
+    fh = (run_dir / "export.lock").open("a")
+    try:
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+        except BlockingIOError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 # -- span assembly -------------------------------------------------------------
@@ -145,14 +177,41 @@ class _Span:
     level: str = ""
 
 
-def build_spans(run_dir: Path, entries: list[dict[str, Any]], *, final: bool) -> tuple[str, list[_Span]]:
-    """Pair journal events into spans. Returns ``(trace_id, spans)``."""
-    trace_id = entries[0]["trace_id"] if entries else ""
-    spans: dict[str, _Span] = {}
-    last_ts = entries[-1]["ts"] if entries else ""
-    obs = "langfuse.observation."
+class SpanBuilder:
+    """Pairs journal events into spans; fed incrementally, in journal order."""
 
-    for e in entries:
+    def __init__(self, run_dir: Path) -> None:
+        self.run_dir = run_dir
+        self.trace_id = ""
+        self.last_ts = ""
+        self.ended = False
+        self.spans: dict[str, _Span] = {}
+
+    def feed(self, entries: list[dict[str, Any]]) -> None:
+        run_dir, spans, obs = self.run_dir, self.spans, "langfuse.observation."
+        for e in entries:
+            self._feed_one(run_dir, spans, obs, e)
+
+    def take(self, sent: set[str], *, final: bool) -> list[_Span]:
+        """Spans ready to send and not in *sent*; on *final*, close open ones."""
+        obs = "langfuse.observation."
+        ready = []
+        for s in self.spans.values():
+            if s.key in sent:
+                continue
+            if not s.end and (final or self.ended):
+                s.end = self.last_ts
+                s.level = "WARNING"
+                s.attrs[f"{obs}metadata.unfinished"] = "true"
+            if s.end:
+                ready.append(s)
+        return ready
+
+    def _feed_one(self, run_dir: Path, spans: dict[str, _Span], obs: str, e: dict[str, Any]) -> None:
+        self.trace_id = self.trace_id or e["trace_id"]
+        self.last_ts = e["ts"]
+        if e["kind"] == "run.end":
+            self.ended = True
         kind, d, ts = e["kind"], e.get("data") or {}, e["ts"]
         span, parent, turn = str(e.get("span_id") or ""), e.get("parent_span_id"), e.get("turn")
         meta = {f"{obs}metadata.agent_id": e.get("agent_id") or ""}
@@ -251,6 +310,10 @@ def build_spans(run_dir: Path, entries: list[dict[str, Any]], *, final: bool) ->
             s.attrs[f"{obs}metadata.duration_ms"] = str(d.get("duration_ms", ""))
             if d.get("is_error"):
                 s.error = d.get("error_kind") or "tool error"
+        elif kind == "tool.result.final" and f"tool:{span}" in spans:
+            s = spans[f"tool:{span}"]
+            s.attrs[f"{obs}metadata.raw_output"] = s.attrs.get(f"{obs}output", "")
+            s.attrs[f"{obs}output"] = _js(_resolve(run_dir, d.get("result")) or "")
         elif kind == "deliverable":
             key = f"deliverable:{e['entry_id']}"
             preview = ""
@@ -272,15 +335,13 @@ def build_spans(run_dir: Path, entries: list[dict[str, Any]], *, final: bool) ->
                 f"{obs}metadata.detail": _js({k: _resolve(run_dir, v) for k, v in d.items()}),
             }, level="WARNING" if kind == "observer.intervention" else "")
 
-    done = [s for s in spans.values() if s.end]
-    if final:
-        for s in spans.values():
-            if not s.end:
-                s.end = last_ts
-                s.level = "WARNING"
-                s.attrs[f"{obs}metadata.unfinished"] = "true"
-                done.append(s)
-    return trace_id, done
+
+
+def build_spans(run_dir: Path, entries: list[dict[str, Any]], *, final: bool) -> tuple[str, list[_Span]]:
+    """Pair all *entries* into spans. Returns ``(trace_id, spans)``."""
+    builder = SpanBuilder(run_dir)
+    builder.feed(entries)
+    return builder.trace_id, builder.take(set(), final=final)
 
 
 def _otlp(trace_id: str, spans: list[_Span]) -> dict[str, Any]:
@@ -340,24 +401,71 @@ async def _post(client: httpx.AsyncClient, trace_id: str, spans: list[_Span]) ->
         raise ExportError(f"OTLP rejected {rejected} spans: {json.dumps(body)[:300]}")
 
 
+class Exporter:
+    """Incremental exporter for one run: reads only new journal entries.
+
+    Spans are recorded as in-flight before each POST; after a lost response
+    the next round asks Langfuse which of them arrived and resends only the
+    rest (Langfuse v4 keeps duplicates, so blind resends are not safe).
+    """
+
+    def __init__(self, run_dir: Path, session_id: str, run_id: str) -> None:
+        self.run_dir, self.session_id, self.run_id = run_dir, session_id, run_id
+        self.builder = SpanBuilder(run_dir)
+        self.cursor = 0
+
+    def _advance(self) -> None:
+        entries = read_entries(self.run_dir, self.session_id, self.run_id, self.cursor)
+        if entries:
+            self.builder.feed(entries)
+            self.cursor = entries[-1]["sequence"]
+
+    async def step(self, *, final: bool = False, wait_lock: bool = False, resend: bool = False) -> int:
+        """Send what is ready. Returns spans sent (0 when another export holds the lock)."""
+        with export_lock(self.run_dir, wait=wait_lock) as locked:
+            if not locked:
+                return 0
+            await asyncio.to_thread(self._advance)
+            sent, inflight = (set(), {}) if resend else load_state(self.run_dir, self.run_id)
+            async with _client() as client:
+                if inflight:
+                    arrived = await _existing_ids(client, self.builder.trace_id)
+                    sent.update(k for k, sid in inflight.items() if sid in arrived)
+                    inflight = {}
+                    save_state(self.run_dir, self.run_id, sent, inflight)
+                todo = self.builder.take(sent, final=final)
+                for i in range(0, len(todo), _BATCH):
+                    chunk = todo[i:i + _BATCH]
+                    inflight = {s.key: s.span_id for s in chunk}
+                    save_state(self.run_dir, self.run_id, sent, inflight)
+                    await _post(client, self.builder.trace_id, chunk)
+                    sent.update(inflight)
+                    inflight = {}
+                    save_state(self.run_dir, self.run_id, sent, inflight)
+            return len(todo)
+
+
+async def _existing_ids(client: httpx.AsyncClient, trace_id: str) -> set[str]:
+    ids: set[str] = set()
+    cursor = None
+    while True:
+        params: dict[str, Any] = {"traceId": trace_id, "limit": 1000, "fields": "core"}
+        if cursor:
+            params["cursor"] = cursor
+        resp = await client.get("/api/public/v2/observations", params=params)
+        resp.raise_for_status()
+        body = resp.json()
+        ids.update(o["id"] for o in body.get("data", []))
+        cursor = (body.get("meta") or {}).get("cursor")
+        if not cursor:
+            return ids
+
+
 async def export_run(
     run_dir: Path, session_id: str, run_id: str, *, final: bool = False, resend: bool = False,
 ) -> int:
-    """Send every completed, not-yet-sent span of one run. Returns spans sent."""
-    entries = read_entries(run_dir, session_id, run_id)
-    if not entries:
-        return 0
-    final = final or any(e["kind"] == "run.end" for e in entries)
-    trace_id, spans = build_spans(run_dir, entries, final=final)
-    sent = set() if resend else load_sent(run_dir, run_id)
-    todo = [s for s in spans if s.key not in sent]
-    async with _client() as client:
-        for i in range(0, len(todo), _BATCH):
-            chunk = todo[i:i + _BATCH]
-            await _post(client, trace_id, chunk)
-            sent.update(s.key for s in chunk)
-            save_sent(run_dir, run_id, sent)
-    return len(todo)
+    """One-shot export of a run (CLI, replay): waits for the export lock."""
+    return await Exporter(run_dir, session_id, run_id).step(final=final, wait_lock=True, resend=resend)
 
 
 def expected_observation_ids(run_dir: Path, session_id: str, run_id: str) -> tuple[str, set[str]]:
@@ -371,6 +479,7 @@ class LiveExporter:
 
     def __init__(self, run: Any) -> None:
         self.run = run
+        self._exporter: Exporter | None = None
         self._stop = asyncio.Event()
         self._task = asyncio.create_task(self._loop())
 
@@ -379,7 +488,9 @@ class LiveExporter:
         return cls(run) if configured() else None
 
     async def _once(self, final: bool = False) -> None:
-        await export_run(self.run.run_dir, self.run.session_id, self.run.run_id, final=final)
+        if self._exporter is None:
+            self._exporter = Exporter(self.run.run_dir, self.run.session_id, self.run.run_id)
+        await self._exporter.step(final=final, wait_lock=final)
 
     async def _loop(self) -> None:
         while not self._stop.is_set():

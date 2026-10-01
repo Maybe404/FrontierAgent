@@ -17,7 +17,11 @@ def with_telemetry(observers: list[Any] | None) -> list[Any] | None:
     run = current_run.get()
     if run is None:
         return observers
-    from frontier_agent.telemetry.observer import InterventionRecorder, TelemetryObserver
+    from frontier_agent.telemetry.observer import (
+        InterventionRecorder,
+        TelemetryObserver,
+        ToolResultTail,
+    )
 
     if any(isinstance(o, TelemetryObserver) for o in observers or []):
         return observers
@@ -26,8 +30,9 @@ def with_telemetry(observers: list[Any] | None) -> list[Any] | None:
     )
     wrapped = [InterventionRecorder(o, telemetry) for o in observers or []]
     # First, so every other observer's view of a turn is journaled after the
-    # raw event it reacted to.
-    return [telemetry, *wrapped]
+    # raw event it reacted to; the tail, last, records tool results as the
+    # model sees them after other observers reshaped them.
+    return [telemetry, *wrapped, ToolResultTail(telemetry)]
 
 
 def wrap_loop(fn: Any) -> Any:

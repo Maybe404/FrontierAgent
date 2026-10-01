@@ -150,9 +150,14 @@ class BenchmarkSession:
             workflow=pipeline_id,
             config={"run_type": md.get("run_type", ""), "profile": md.get("profile", "")},
             outputs_dir=Path(outputs) if outputs else None,
-        ):
-            return await self._run(instruction, meta=meta, pipeline_id=pipeline_id,
-                                   extra_input=extra_input)
+        ) as run:
+            state = await self._run(instruction, meta=meta, pipeline_id=pipeline_id,
+                                    extra_input=extra_input)
+            if run is not None:
+                run.set_answer(str(state.get("final_answer") or state.get("final_content") or ""))
+                if state.get("stopped_by") == "llm_error":
+                    run.set_outcome("failed", f"llm_error: {state.get('llm_error') or ''}")
+            return state
 
     async def _run(
         self,

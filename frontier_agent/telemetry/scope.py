@@ -43,11 +43,14 @@ async def telemetry_run(
         logger.exception("telemetry: could not start run journal; continuing without it")
         yield None
         return
+    before = TelemetryRun.snapshot_outputs(Path(outputs_dir)) if outputs_dir is not None else None
     token = current_run.set(run)
     status, error = "completed", ""
     exporter = _start_exporter(run)
     try:
         yield run
+        if run.outcome is not None:
+            status, error = run.outcome
     except (asyncio.CancelledError, KeyboardInterrupt):
         status = "cancelled"
         raise
@@ -58,7 +61,7 @@ async def telemetry_run(
         current_run.reset(token)
         if outputs_dir is not None:
             with contextlib.suppress(Exception):
-                await asyncio.shield(run.record_outputs(Path(outputs_dir)))
+                await asyncio.shield(run.record_outputs(Path(outputs_dir), before))
         with contextlib.suppress(Exception):
             await asyncio.shield(run.end(status=status, error=error))
         if exporter is not None:

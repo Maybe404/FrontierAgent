@@ -7,6 +7,8 @@ on; it never returns an intervention. One instance per agent loop.
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 import time
 from collections.abc import Awaitable, Callable
 from typing import Any, cast
@@ -40,6 +42,19 @@ _CONFIG_FIELDS = (
 )
 
 
+def _guarded(fn: Any) -> Any:
+    """Journal failures never reach the loop, but always reach the run's
+    error count (so run.end reports complete=false)."""
+    @functools.wraps(fn)
+    async def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        try:
+            return await fn(self, *args, **kwargs)
+        except Exception as exc:
+            self.run.note_failure(f"{type(self).__name__}.{fn.__name__}", exc)
+            return None
+    return wrapper
+
+
 class TelemetryObserver(BaseObserver):
     critical = True
 
@@ -52,6 +67,8 @@ class TelemetryObserver(BaseObserver):
         self._first_token_seen: set[str] = set()
         self._tool_spans: dict[str, str] = {}
         self._tool_started: dict[str, float] = {}
+        self._raw_results: dict[str, str] = {}
+        self._result_spans: dict[str, str] = {}
 
     async def _emit(self, kind: str, data: dict[str, Any], *, turn: int | None = None,
                     span_id: str | None = None, parent: str | None = None, **kw: Any) -> None:
@@ -147,6 +164,8 @@ class TelemetryObserver(BaseObserver):
     async def on_tool_result(self, ctx: TurnContext, result: ToolResult) -> ToolResult | None:
         span = self._tool_spans.pop(result.tool_call_id, None) or new_span_id()
         self._tool_started.pop(result.tool_call_id, None)
+        self._raw_results[result.tool_call_id] = result.result or ""
+        self._result_spans[result.tool_call_id] = span
         await self._emit("tool.result", {
             "tool_call_id": result.tool_call_id,
             "name": result.name,
@@ -198,7 +217,7 @@ class TelemetryObserver(BaseObserver):
             "tool_calls": result.tool_calls_count,
             "final_content": result.final_content or "",
         })
-        if self.parent_span_id == self.run.root_span_id:
+        if self.parent_span_id == self.run.root_span_id and not self.run.answer_explicit:
             self.run.final_output = result.final_content or ""
         self._reset_span()
 
@@ -213,6 +232,40 @@ class TelemetryObserver(BaseObserver):
             with contextlib.suppress(ValueError):
                 current_agent_span.reset(self._token)
             self._token = None
+
+
+def _guard_hooks(cls: type) -> None:
+    for name, fn in list(vars(cls).items()):
+        if name.startswith("on_") and inspect.iscoroutinefunction(fn):
+            setattr(cls, name, _guarded(fn))
+
+
+_guard_hooks(TelemetryObserver)
+
+
+class ToolResultTail(BaseObserver):
+    """Runs after every other observer: journals the tool result exactly as
+    the model will see it, when another observer reshaped it."""
+
+    critical = True
+
+    def __init__(self, head: TelemetryObserver) -> None:
+        self.head = head
+        self.run = head.run            # for the failure guard
+
+    async def on_tool_result(self, ctx: TurnContext, result: ToolResult) -> ToolResult | None:
+        raw = self.head._raw_results.pop(result.tool_call_id, None)
+        final = result.result or ""
+        if raw is not None and raw != final:
+            await self.head._emit("tool.result.final", {
+                "tool_call_id": result.tool_call_id, "name": result.name,
+                "result": final, "raw_chars": len(raw), "final_chars": len(final),
+            }, turn=ctx.turn, span_id=self.head._result_spans.pop(result.tool_call_id, None),
+               parent=self.head.span_id)
+        return None
+
+
+_guard_hooks(ToolResultTail)
 
 
 def _call_name_args(tool_call: dict[str, Any]) -> tuple[str, Any]:
