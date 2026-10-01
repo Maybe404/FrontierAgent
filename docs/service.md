@@ -54,6 +54,12 @@ results are read from the journal.
 
 ## API
 
+The full reference is served by the service itself: `/docs` (English / 中文),
+generated from the code, with the raw documents at `/openapi.json` and
+`/openapi.zh-CN.json` for import into Apifox or Postman. Field descriptions
+live in `agent_service/schemas.py`; the Chinese text in
+`agent_service/openapi/zh-CN.yaml` (see `AGENTS.md`).
+
 | Method | Path | Description |
 |---|---|---|
 | `POST` | `/v1/tasks` | `{"task", "mode"?, "request_id"?, "max_turns"?}` → `202`. Same `request_id` returns the existing task (`created: false`). |

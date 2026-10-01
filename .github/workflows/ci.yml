@@ -40,8 +40,9 @@ jobs:
             -f compose.dev.yaml config --quiet
       - name: Framework import smoke (eval layer blocked)
         run: uv run python tools/import_smoke.py --stage 1
+      # `service` too: without fastapi the agent_service tests skip silently.
       - name: Install eval dependencies
-        run: uv sync --locked --extra dev --extra sandbox --extra document-readers --extra hf-space --extra eval
+        run: uv sync --locked --extra dev --extra sandbox --extra document-readers --extra hf-space --extra eval --extra service
       - name: Eval import smoke and symbol closure
         run: |
           uv run python tools/import_smoke.py --stage 2

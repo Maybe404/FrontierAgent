@@ -32,7 +32,14 @@ def spec(client) -> dict:
 def test_overlay_is_complete_and_up_to_date(spec, locale) -> None:
     # Fails when an endpoint or field is added without a translation, when the
     # English text changes without the translation, or when a target is gone.
-    assert docs.check_overlay(spec, docs.load_overlay(locale)) == []
+    overlay = docs.load_overlay(locale)
+    problems = docs.check_overlay(spec, overlay)
+    assert not problems, (
+        "\n".join(problems)
+        + f"\n\nFix agent_service/openapi/{locale}.yaml (see AGENTS.md). For each target below, replace its "
+        "action if one exists, otherwise append it under `actions:`, then fill in every empty `update` "
+        "value; keep `x-source` exactly as given.\n\n" + docs.overlay_stub(spec, overlay)
+    )
 
 
 def test_translated_document_changes_only_text(client, spec) -> None:
@@ -64,8 +71,35 @@ def test_missing_target_and_untranslated_text_are_reported(spec) -> None:
     changed["components"]["schemas"]["Task"]["properties"]["status"]["description"] = "Changed."
     changed["components"]["schemas"]["Task"]["properties"]["new_field"] = {"description": "New."}
     problems = docs.check_overlay(changed, docs.load_overlay("zh-CN"))
-    assert "target not found: $.paths['/v1/tasks'].post.responses['413']" in problems
+    assert "target not found (delete this action): $.paths['/v1/tasks'].post.responses['413']" in problems
     assert "untranslated: $.components.schemas.Task.properties.new_field description" in problems
+
+
+def test_stub_lists_only_what_to_fix_and_filling_it_passes(spec) -> None:
+    import yaml
+
+    overlay = docs.load_overlay("zh-CN")
+    assert docs.overlay_stub(spec, overlay) == ""
+
+    changed = copy.deepcopy(spec)
+    changed["paths"]["/v1/tasks"]["post"]["summary"] = "Submit an agent task"
+    changed["components"]["schemas"]["Task"]["properties"]["new_field"] = {"description": "New."}
+    stubs = yaml.safe_load(docs.overlay_stub(changed, overlay))
+    by_target = {s["target"]: s for s in stubs}
+    assert set(by_target) == {"$.paths['/v1/tasks'].post", "$.components.schemas.Task.properties.new_field"}
+    post = by_target["$.paths['/v1/tasks'].post"]
+    assert post["update"]["summary"] == "" and post["x-source"]["summary"] == "Submit an agent task"
+    assert post["update"]["description"].startswith("将任务加入队列")   # still-valid translation kept
+
+    # An empty value counts as untranslated and never blanks the page.
+    actions = [a for a in overlay["actions"] if a["target"] not in by_target] + stubs
+    assert "untranslated: $.paths['/v1/tasks'].post summary" in docs.check_overlay(changed, {"actions": actions})
+    assert docs.apply_overlay(changed, {"actions": actions})["paths"]["/v1/tasks"]["post"]["summary"] == \
+        "Submit an agent task"
+
+    for s in stubs:
+        s["update"] = {k: v or "译文" for k, v in s["update"].items()}
+    assert docs.check_overlay(changed, {"actions": actions}) == []
 
 
 def test_resolve_supports_keys_quoted_keys_and_filters() -> None:

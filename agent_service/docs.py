@@ -129,7 +129,7 @@ def apply_overlay(spec: dict[str, Any], overlay: dict[str, Any]) -> dict[str, An
             continue
         if any(original.get(k) != v for k, v in (action.get("x-source") or {}).items()):
             continue
-        node.update(action.get("update") or {})
+        node.update({k: v for k, v in (action.get("update") or {}).items() if v})
     return doc
 
 
@@ -141,7 +141,7 @@ def check_overlay(spec: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
         target = action["target"]
         node = resolve(spec, target)
         if not isinstance(node, dict):
-            problems.append(f"target not found: {target}")
+            problems.append(f"target not found (delete this action): {target}")
             continue
         update, source = action.get("update") or {}, action.get("x-source") or {}
         if set(update) != set(source):
@@ -149,12 +149,41 @@ def check_overlay(spec: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
         for k, v in source.items():
             if node.get(k) != v:
                 problems.append(f"stale (English changed): {target} {k}")
-        seen.setdefault(target, set()).update(update)
+        seen.setdefault(target, set()).update(k for k, v in update.items() if v)
     for target, texts in translatable(spec).items():
         for k in texts:
             if k not in seen.get(target, set()):
                 problems.append(f"untranslated: {target} {k}")
     return problems
+
+
+class _Dumper(yaml.SafeDumper):
+    pass
+
+
+def _str(dumper: yaml.SafeDumper, s: str) -> yaml.Node:
+    return dumper.represent_scalar("tag:yaml.org,2002:str", s, style="|" if "\n" in s else None)
+
+
+_Dumper.add_representer(str, _str)
+
+
+def overlay_stub(spec: dict[str, Any], overlay: dict[str, Any]) -> str:
+    """Ready-to-paste actions for every target whose translation is missing or
+    stale: ``x-source`` holds the current English, ``update`` keeps translations
+    that are still valid and leaves the rest empty to fill in."""
+    actions = {a["target"]: a for a in overlay.get("actions") or []}
+    stubs = []
+    for target, english in translatable(spec).items():
+        action = actions.get(target) or {}
+        source, update = action.get("x-source") or {}, action.get("update") or {}
+        if all(source.get(k) == v and update.get(k) for k, v in english.items()):
+            continue
+        keep = {k: update[k] for k, v in english.items() if source.get(k) == v and update.get(k)}
+        stubs.append({"target": target, "update": {k: keep.get(k, "") for k in english}, "x-source": english})
+    if not stubs:
+        return ""
+    return yaml.dump(stubs, Dumper=_Dumper, allow_unicode=True, sort_keys=False, width=1000)
 
 
 def _page(title: str, configs: list[dict[str, Any]]) -> str:
