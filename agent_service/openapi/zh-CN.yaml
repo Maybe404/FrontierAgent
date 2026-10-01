@@ -418,9 +418,9 @@ actions:
     description: Human-readable failure reason; null for completed tasks.
 - target: $.components.schemas.SubmitResponse.properties.error_code
   update:
-    description: 供程序分支判断的失败原因：`llm_error`、`incomplete`、`agent_error`、`worker_crashed`、`timeout`、`cancelled`、`service_restart`、`internal`。仅在任务失败、超时或被取消时有值，否则为 null。今后可能新增取值。
+    description: 供程序分支判断的失败原因：`llm_error`、`incomplete`、`agent_error`、`worker_crashed`、`timeout`、`cancelled`、`service_shutdown`、`service_restart`、`internal`。仅在任务失败、超时或被取消时有值，否则为 null。今后可能新增取值。
   x-source:
-    description: 'Machine-readable failure reason for branching: `llm_error`, `incomplete`, `agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_restart`, `internal`. Null unless the task failed, timed out or was cancelled. New codes may be added.'
+    description: 'Machine-readable failure reason for branching: `llm_error`, `incomplete`, `agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_shutdown`, `service_restart`, `internal`. Null unless the task failed, timed out or was cancelled. New codes may be added.'
 - target: $.components.schemas.SubmitResponse.properties.complete
   update:
     description: 智能体是否报告任务已全部完成；进入终态前为 null。
@@ -488,9 +488,9 @@ actions:
     description: Human-readable failure reason; null for completed tasks.
 - target: $.components.schemas.Task.properties.error_code
   update:
-    description: 供程序分支判断的失败原因：`llm_error`、`incomplete`、`agent_error`、`worker_crashed`、`timeout`、`cancelled`、`service_restart`、`internal`。仅在任务失败、超时或被取消时有值，否则为 null。今后可能新增取值。
+    description: 供程序分支判断的失败原因：`llm_error`、`incomplete`、`agent_error`、`worker_crashed`、`timeout`、`cancelled`、`service_shutdown`、`service_restart`、`internal`。仅在任务失败、超时或被取消时有值，否则为 null。今后可能新增取值。
   x-source:
-    description: 'Machine-readable failure reason for branching: `llm_error`, `incomplete`, `agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_restart`, `internal`. Null unless the task failed, timed out or was cancelled. New codes may be added.'
+    description: 'Machine-readable failure reason for branching: `llm_error`, `incomplete`, `agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_shutdown`, `service_restart`, `internal`. Null unless the task failed, timed out or was cancelled. New codes may be added.'
 - target: $.components.schemas.Task.properties.complete
   update:
     description: 智能体是否报告任务已全部完成；进入终态前为 null。

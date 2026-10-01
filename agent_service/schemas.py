@@ -99,7 +99,8 @@ class Task(BaseModel):
     error_code: str | None = Field(
         default=None,
         description="Machine-readable failure reason for branching: `llm_error`, `incomplete`, "
-        "`agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_restart`, `internal`. "
+        "`agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_shutdown`, `service_restart`, "
+        "`internal`. "
         "Null unless the task failed, timed out or was cancelled. New codes may be added.",
     )
     complete: bool | None = Field(default=None,
