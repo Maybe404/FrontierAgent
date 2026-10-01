@@ -128,7 +128,40 @@ class BenchmarkSession:
         pipeline_id: str,
         extra_input: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Execute one benchmark question and return the final pipeline state."""
+        """Execute one benchmark question and return the final pipeline state.
+
+        Journaled by ``frontier_agent.telemetry``: callers that already opened
+        a run (the terminal) are joined; otherwise a run is opened in the
+        ``_trial_dir`` the caller gave (benchmarks, web demo).
+        """
+        from frontier_agent.telemetry.run import current_run
+        from frontier_agent.telemetry.scope import telemetry_run
+
+        md = meta or {}
+        trial_dir = md.get("_trial_dir")
+        if current_run.get() is not None or not trial_dir:
+            return await self._run(instruction, meta=meta, pipeline_id=pipeline_id,
+                                   extra_input=extra_input)
+        outputs = os.environ.get("FRONTIER_AGENT_OUTPUTS_DIR", "").strip()
+        async with telemetry_run(
+            run_dir=Path(trial_dir) / "journal",
+            session_id=str(md.get("session_id") or md.get("run_id") or Path(trial_dir).name),
+            task=instruction,
+            workflow=pipeline_id,
+            config={"run_type": md.get("run_type", ""), "profile": md.get("profile", "")},
+            outputs_dir=Path(outputs) if outputs else None,
+        ):
+            return await self._run(instruction, meta=meta, pipeline_id=pipeline_id,
+                                   extra_input=extra_input)
+
+    async def _run(
+        self,
+        instruction: str,
+        *,
+        meta: dict[str, Any] | None,
+        pipeline_id: str,
+        extra_input: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         task = await self.pm.create_task(instruction)
         task_id = str(task.id)
 

@@ -310,3 +310,34 @@ async def test_stress_100_agents_concurrently(tmp_path: Path) -> None:
     assert {e["parent_span_id"] for e in starts[1:]} == {main.span_id}
     # 100 agents x 22 events; generous bound, catches lock-contention regressions.
     assert elapsed < 60, f"journaling 2200 events took {elapsed:.1f}s"
+
+
+async def test_benchmark_session_journals_into_trial_dir(tmp_path: Path, monkeypatch) -> None:
+    from benchmarks.public.core.kernel_adapter import BenchmarkSession
+
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    monkeypatch.setenv("FRONTIER_AGENT_OUTPUTS_DIR", str(outputs))
+
+    async def fake_run(self, instruction, *, meta, pipeline_id, extra_input):
+        observers = with_telemetry([]) or []   # empty when no run is open
+        for obs in observers:
+            await obs.on_loop_start(LoopConfig(role_id="bench"))
+        (outputs / "answer.txt").write_text("42")
+        for obs in observers:
+            await obs.on_loop_end(AgentLoopResult(messages=[], final_content="42", stopped_by="no_tool"))
+        return {"final_answer": "42"}
+
+    monkeypatch.setattr(BenchmarkSession, "_run", fake_run)
+    session = BenchmarkSession.__new__(BenchmarkSession)
+    state = await session.run("q?", meta={"_trial_dir": str(tmp_path / "trial"), "run_type": "bench"},
+                              pipeline_id="stateful-react-agent")
+    assert state == {"final_answer": "42"}
+    journal = tmp_path / "trial" / "journal"
+    (session_id, run_id), = lf.list_runs(journal)
+    entries = lf.read_entries(journal, session_id, run_id)
+    assert [e["kind"] for e in entries] == ["run.start", "loop.start", "loop.end", "deliverable", "run.end"]
+    assert entries[-1]["data"]["output"] == "42"
+
+    # Without a trial dir (and no open run) nothing is journaled.
+    assert await session.run("q?", meta={}, pipeline_id="x") == {"final_answer": "42"}

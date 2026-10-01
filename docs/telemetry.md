@@ -15,6 +15,18 @@ sub-agents through the AgentBus composition
 Each existing observer is wrapped so the interventions it returns are
 journaled too.
 
+Runs are opened by every entry point:
+
+| Entry point | Journal location |
+|---|---|
+| `frontier-agent` CLI / TUI | `<cwd>/.apodex/runs/<session-id>/` |
+| `agent_service` HTTP API | `<SERVICE_DATA_DIR>/tasks/<task-id>/.apodex/runs/<session-id>/` |
+| benchmarks (Harbor) and the web demo (`BenchmarkSession` with `_trial_dir`) | `<trial_dir>/journal/` |
+
+On exit, the top-level agent's final answer is written to `run.end` and every
+file in the outputs directory is journaled as a `deliverable` (path, size,
+sha256, content up to 50 MB).
+
 | Event | Content |
 |---|---|
 | `run.start` / `run.end` | task, versions and git commit, deployment env, status, `complete` flag |
@@ -49,7 +61,24 @@ python -m frontier_agent.telemetry show   <run_dir>   # event timeline (--full f
 python -m frontier_agent.telemetry check  <run_dir>   # seq gaps, missing run.end, lost writes
 python -m frontier_agent.telemetry export <run_dir>   # send unsent spans to Langfuse
 python -m frontier_agent.telemetry verify <run_dir>   # reconcile journal vs Langfuse
+python -m frontier_agent.telemetry recover <run_dir>  # close a run left open by a dead process
+python -m frontier_agent.telemetry archive <runs_root> --archive-root DIR --older-than-days 7
+python -m frontier_agent.telemetry prune   <runs_root> --archive-root DIR --older-than-days 30 [--max-gb 50] [--dry-run]
 ```
+
+A run whose process died is closed automatically (synthetic `run.end`,
+status `crashed`) the next time a run starts in that directory. `archive`
+writes checksummed `.tar.gz` files through `ArchiveStore` (local today; an
+object-storage backend implements the same two methods). `prune` deletes the
+oldest closed runs by age or total size, and only runs already archived
+unless `--force`.
+
+## Redaction
+
+Exported text (Langfuse, API event stream) is masked: values of env vars named
+like `*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*`, API keys, bearer tokens, JWTs,
+private keys, emails, CN mobile and ID numbers. The local journal keeps the
+original. `FRONTIER_TELEMETRY_REDACT=0` disables masking.
 
 ## Langfuse
 
