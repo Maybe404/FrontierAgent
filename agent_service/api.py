@@ -46,7 +46,7 @@ class SubmitRequest(BaseModel):
 
 def _public(row: dict[str, Any]) -> dict[str, Any]:
     keys = ("id", "request_id", "mode", "status", "created_at", "started_at", "finished_at",
-            "answer", "error", "complete", "deliverables", "exit_code")
+            "answer", "error", "error_code", "complete", "deliverables", "exit_code")
     return {k: row.get(k) for k in keys}
 
 

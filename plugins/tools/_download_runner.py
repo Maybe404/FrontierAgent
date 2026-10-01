@@ -133,6 +133,9 @@ def _opener(ip: str) -> urllib.request.OpenerDirector:
     )
 
 
+_FAKE_IP_RANGE = ipaddress.IPv4Network("198.18.0.0/15")
+
+
 def _local_fake_ip_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...]:
     """Opt-in ranges a local proxy's fake-IP DNS hands out (e.g. Surge/Clash
     use 198.18.0.0/15). Off unless ``FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS`` is
@@ -141,8 +144,15 @@ def _local_fake_ip_networks() -> tuple[ipaddress.IPv4Network | ipaddress.IPv6Net
     nets = []
     for part in raw.split(","):
         part = part.strip()
-        if part:
-            nets.append(ipaddress.ip_network(part, strict=False))
+        if not part:
+            continue
+        try:
+            net = ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            continue                    # malformed: ignore rather than break every fetch
+        # Only the RFC 2544 range proxies use for fake IPs; never a wider hole.
+        if isinstance(net, ipaddress.IPv4Network) and net.subnet_of(_FAKE_IP_RANGE):
+            nets.append(net)
     return tuple(nets)
 
 

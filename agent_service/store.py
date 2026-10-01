@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     workdir TEXT NOT NULL,
     answer TEXT,
     error TEXT,
+    error_code TEXT,
     complete INTEGER,
     deliverables_json TEXT
 );
@@ -33,7 +34,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
 """
 
 ACTIVE = ("queued", "running", "cancelling")
-FINAL = ("completed", "failed", "cancelled")
+FINAL = ("completed", "failed", "cancelled", "timed_out")
+# Columns added after the first release; created on open if missing.
+_MIGRATIONS = {"error_code": "TEXT"}
 
 
 def now() -> str:
@@ -46,6 +49,10 @@ class TaskStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with closing(self._connect()) as con, con:
             con.executescript(_SCHEMA)
+            have = {r[1] for r in con.execute("PRAGMA table_info(tasks)")}
+            for col, typ in _MIGRATIONS.items():
+                if col not in have:
+                    con.execute(f"ALTER TABLE tasks ADD COLUMN {col} {typ}")
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30)
@@ -108,6 +115,8 @@ class TaskStore:
 
     def transition(self, task_id: str, from_status: tuple[str, ...], to_status: str, **fields: Any) -> bool:
         """Compare-and-set status change; False when the task was not in *from_status*."""
+        if "deliverables" in fields:
+            fields["deliverables_json"] = json.dumps(fields.pop("deliverables"), ensure_ascii=False)
         marks = ",".join("?" for _ in from_status)
         sets = ", ".join(["status=?", *(f"{k}=?" for k in fields)])
         with closing(self._connect()) as con, con:

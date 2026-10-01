@@ -7,6 +7,7 @@ journal (via frontier_agent.telemetry), so no model or network is needed.
 from __future__ import annotations
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -64,7 +65,7 @@ def _wait(client, task_id: str, timeout: float = 30) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         row = client.get(f"/v1/tasks/{task_id}").json()
-        if row["status"] in ("completed", "failed", "cancelled"):
+        if row["status"] in ("completed", "failed", "cancelled", "timed_out"):
             return row
         time.sleep(0.2)
     raise AssertionError(f"task {task_id} did not finish: {row}")
@@ -119,7 +120,7 @@ def test_cancel_running_task_is_graceful(client) -> None:
     time.sleep(1.0)                 # let the worker open its journal
     assert client.post(f"/v1/tasks/{task_id}/cancel").json()["status"] == "cancelling"
     row = _wait(client, task_id)
-    assert row["status"] == "cancelled"
+    assert row["status"] == "cancelled" and row["error_code"] == "cancelled"
     workdir = Path(client.app.state.store.get(task_id)["workdir"])
     assert engine.read_result(workdir).status == "cancelled"
 
@@ -128,6 +129,7 @@ def test_crashed_worker_is_failed_with_synthetic_run_end(client) -> None:
     task_id = client.post("/v1/tasks", json={"task": "crash now"}).json()["id"]
     row = _wait(client, task_id)
     assert row["status"] == "failed" and row["exit_code"] == 3
+    assert row["error_code"] == "worker_crashed"
     workdir = Path(client.app.state.store.get(task_id)["workdir"])
     assert engine.read_result(workdir).status == "crashed"
 
@@ -141,6 +143,64 @@ def test_restart_fails_orphaned_running_rows(tmp_path: Path, client) -> None:
 
     asyncio.run(client.app.state.runner._recover_after_restart())
     after = store.get(row["id"])
-    assert after["status"] == "failed"
+    assert after["status"] == "failed" and after["error_code"] == "service_restart"
     assert "restarted" in after["error"]
     assert json.loads(json.dumps(after["deliverables"])) == []
+
+
+def test_worker_env_is_an_allowlist() -> None:
+    env = engine.build_env(task_id="t", request_id="r", source={
+        "PATH": "/bin", "OPENAI_API_KEY": "k", "SYNCO_SEARCH_TOKEN": "s",
+        "SERVICE_API_TOKEN": "secret", "LANGFUSE_SECRET_KEY": "lf", "AWS_SECRET_ACCESS_KEY": "aws",
+        "FRONTIER_TELEMETRY": "0", "FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS": "198.18.0.0/15",
+    })
+    assert env["OPENAI_API_KEY"] == "k" and env["SYNCO_SEARCH_TOKEN"] == "s" and env["PATH"] == "/bin"
+    for leaked in ("SERVICE_API_TOKEN", "LANGFUSE_SECRET_KEY", "AWS_SECRET_ACCESS_KEY",
+                   "FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS"):
+        assert leaked not in env
+    assert env["FRONTIER_TELEMETRY"] == "1"       # the service needs the journal
+    assert "FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS" in engine.build_env(
+        task_id="t", request_id="r", allow_fake_ip=True,
+        source={"FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS": "198.18.0.0/15"})
+
+
+def test_fake_ip_optin_requires_loopback(monkeypatch) -> None:
+    monkeypatch.setenv("SERVICE_ALLOW_FAKE_IP", "1")
+    assert ServiceConfig.from_env(host="127.0.0.1").allow_fake_ip is True
+    assert ServiceConfig.from_env(host="0.0.0.0").allow_fake_ip is False
+
+
+def test_timeout_is_reported_as_timed_out(tmp_path: Path, monkeypatch) -> None:
+    script = tmp_path / "fake_worker.py"
+    script.write_text(FAKE_WORKER, encoding="utf-8")
+    monkeypatch.setattr(engine, "build_command",
+                        lambda *, task, mode, workdir, max_turns: [sys.executable, str(script), str(workdir), task])
+    cfg = ServiceConfig(data_dir=tmp_path / "svc", api_token="", max_concurrency=1,
+                        task_timeout_s=2, cancel_grace_s=5, default_mode="react", max_task_chars=1000)
+    with TestClient(create_app(cfg)) as c:
+        task_id = c.post("/v1/tasks", json={"task": "sleep long"}).json()["id"]
+        row = _wait(c, task_id)
+    assert row["status"] == "timed_out" and row["error_code"] == "timeout"
+
+
+def test_completed_task_is_not_overwritten_by_late_cancel(client) -> None:
+    task_id = client.post("/v1/tasks", json={"task": "quick"}).json()["id"]
+    assert _wait(client, task_id)["status"] == "completed"
+    assert client.post(f"/v1/tasks/{task_id}/cancel").json()["status"] == "completed"
+
+
+def test_classify_prefers_a_completed_run_over_cancelling() -> None:
+    from agent_service.runner import _classify
+
+    done = engine.RunResult(status="completed", answer="a")
+    assert _classify(done, 0, {"status": "cancelling"}, forced=None, timed_out=False) == ("completed", None)
+    failed = engine.RunResult(status="failed", error="llm_error: 503")
+    assert _classify(failed, 1, {"status": "running"}, forced=None, timed_out=False) == ("failed", "llm_error")
+    inc = engine.RunResult(status="incomplete")
+    assert _classify(inc, 1, {"status": "running"}, forced=None, timed_out=False) == ("failed", "incomplete")
+
+
+def test_restart_never_signals_a_process_that_is_not_our_worker(tmp_path: Path) -> None:
+    from agent_service.runner import _is_our_worker
+
+    assert _is_our_worker(os.getpid(), tmp_path / "not-in-my-cmdline") is False

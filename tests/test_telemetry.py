@@ -417,3 +417,10 @@ async def test_tail_records_tool_result_as_the_model_sees_it(tmp_path: Path) -> 
     _, spans = lf.build_spans(tmp_path, _entries(run), final=True)
     tool = next(s for s in spans if s.name == "tool:web_fetch")
     assert tool.attrs["langfuse.observation.output"] == "abc"
+
+
+def test_fake_ip_optin_is_limited_to_the_proxy_range(monkeypatch) -> None:
+    from plugins.tools._download_runner import _local_fake_ip_networks
+
+    monkeypatch.setenv("FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS", "0.0.0.0/0, 10.0.0.0/8, nonsense, 198.18.0.0/15")
+    assert [str(n) for n in _local_fake_ip_networks()] == ["198.18.0.0/15"]

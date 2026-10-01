@@ -29,12 +29,39 @@ def build_command(*, task: str, mode: str, workdir: Path, max_turns: int | None)
     return [*cmd, "--", task]
 
 
-def build_env(*, task_id: str, request_id: str) -> dict[str, str]:
-    env = dict(os.environ)
-    env["FRONTIER_TASK_ID"] = task_id
-    env["FRONTIER_REQUEST_ID"] = request_id
-    env["PYTHONUNBUFFERED"] = "1"
-    env.setdefault("NO_COLOR", "1")
+# Workers get only what running an agent needs. Service credentials
+# (SERVICE_API_TOKEN, LANGFUSE_*) never reach them: the agent auto-approves
+# tools and reads untrusted web content, so its process holds as few secrets
+# as possible. Export to Langfuse happens in the service process.
+_ENV_PREFIXES = (
+    "OPENAI_", "SUMMARY_LLM_", "SYNCO_SEARCH_", "SERPER_", "JINA_", "READDOC_",
+    "APODEX_", "SANDBOX_", "BASH_", "OFFICEQA_", "LC_",
+)
+_ENV_NAMES = frozenset({
+    "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "TMPDIR", "TERM",
+    "PYTHONPATH", "VIRTUAL_ENV", "UV_CACHE_DIR", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "no_proxy",
+    "FRONTIER_AGENT_TOOL_USER", "FRONTIER_AGENT_TOOL_ENV_ALLOWLIST",
+    "FRONTIER_TELEMETRY_REDACT",
+})
+_FAKE_IP_VAR = "FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS"
+
+
+def build_env(*, task_id: str, request_id: str, allow_fake_ip: bool = False,
+              source: dict[str, str] | None = None) -> dict[str, str]:
+    src = dict(os.environ if source is None else source)
+    env = {k: v for k, v in src.items() if k in _ENV_NAMES or k.startswith(_ENV_PREFIXES)}
+    if allow_fake_ip and src.get(_FAKE_IP_VAR):
+        env[_FAKE_IP_VAR] = src[_FAKE_IP_VAR]
+    env.update({
+        "FRONTIER_TASK_ID": task_id,
+        "FRONTIER_REQUEST_ID": request_id,
+        # The service decides task results from the journal; never disable it.
+        "FRONTIER_TELEMETRY": "1",
+        "PYTHONUNBUFFERED": "1",
+        "NO_COLOR": "1",
+    })
     return env
 
 
@@ -51,6 +78,16 @@ def run_dir(workdir: Path) -> Path | None:
 def outputs_dir(workdir: Path) -> Path | None:
     rd = run_dir(workdir)
     return rd / "outputs" if rd else None
+
+
+def session_ids(workdir: Path) -> list[tuple[Path, str, str]]:
+    """``(run_dir, session_id, run_id)`` for each run journaled under *workdir*."""
+    rd = run_dir(workdir)
+    if rd is None:
+        return []
+    from frontier_agent.telemetry.langfuse_export import list_runs
+
+    return [(rd, s, r) for s, r in list_runs(rd)]
 
 
 @dataclass

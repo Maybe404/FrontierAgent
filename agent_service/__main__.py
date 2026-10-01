@@ -23,8 +23,13 @@ def main() -> None:
     import uvicorn
 
     from agent_service.api import create_app
+    from agent_service.config import ServiceConfig
 
-    uvicorn.run(create_app(), host=a.host, port=a.port, log_level="info")
+    cfg = ServiceConfig.from_env(host=a.host)
+    if not cfg.loopback and not cfg.api_token:
+        # Workers run with every tool auto-approved; never expose that unauthenticated.
+        raise SystemExit(f"refusing to listen on {a.host} without SERVICE_API_TOKEN")
+    uvicorn.run(create_app(cfg), host=a.host, port=a.port, log_level="info")
 
 
 if __name__ == "__main__":
