@@ -29,6 +29,16 @@ class ServiceConfig:
     # Pass the local-proxy fake-IP opt-in to workers. Only honoured for a
     # loopback-bound service with SERVICE_ALLOW_FAKE_IP=1 (local development).
     allow_fake_ip: bool = False
+    # API reference at /docs, /openapi.json, /openapi.<locale>.json: "on" or
+    # "off". A docs password puts them behind HTTP Basic auth (any user name);
+    # it is separate from api_token, which can run tasks.
+    docs: str = "on"
+    docs_password: str = ""
+    docs_try_it: bool = True
+
+    def __post_init__(self) -> None:
+        if self.docs not in ("on", "off"):
+            raise ValueError(f"SERVICE_DOCS must be 'on' or 'off', got {self.docs!r}")
 
     @property
     def loopback(self) -> bool:
@@ -54,4 +64,7 @@ class ServiceConfig:
             cancel_grace_s=_int("SERVICE_CANCEL_GRACE_S", 60),
             default_mode=os.getenv("SERVICE_DEFAULT_MODE", "react"),
             max_task_chars=_int("SERVICE_MAX_TASK_CHARS", 20_000),
+            docs=os.getenv("SERVICE_DOCS", "on").strip().lower() or "on",
+            docs_password=os.getenv("SERVICE_DOCS_PASSWORD", "").strip(),
+            docs_try_it=os.getenv("SERVICE_DOCS_TRY_IT", "1").strip() != "0",
         )

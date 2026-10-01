@@ -41,6 +41,9 @@ SERVICE_API_TOKEN=... uv run python -m agent_service --host 127.0.0.1 --port 880
 | `SERVICE_DEFAULT_MODE` | `react` | `react`, `agent_team`, `research`, `coding` |
 | `SERVICE_MAX_TASK_CHARS` | `20000` | reject longer task text |
 | `SERVICE_ALLOW_FAKE_IP` | off | local development only: pass `FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS` to workers; ignored unless bound to loopback |
+| `SERVICE_DOCS` | `on` | `off` removes `/docs`, `/openapi.json` and `/openapi.zh-CN.json` (404) |
+| `SERVICE_DOCS_PASSWORD` | empty (open) | put the docs behind HTTP Basic auth (any user name, this password); separate from `SERVICE_API_TOKEN`, which can run tasks |
+| `SERVICE_DOCS_TRY_IT` | `1` | `0` hides the docs page's send-request and API-client buttons |
 
 The service refuses to start on a non-loopback address without
 `SERVICE_API_TOKEN`: workers auto-approve every tool.
@@ -59,6 +62,11 @@ generated from the code, with the raw documents at `/openapi.json` and
 `/openapi.zh-CN.json` for import into Apifox or Postman. Field descriptions
 live in `agent_service/schemas.py`; the Chinese text in
 `agent_service/openapi/zh-CN.yaml` (see `AGENTS.md`).
+
+Each environment serves the docs of the code it runs, so a release updates
+them. For production, keep them reachable for integrators but read-only and
+behind a password: `SERVICE_DOCS_PASSWORD=<secret>` and
+`SERVICE_DOCS_TRY_IT=0`; or `SERVICE_DOCS=off` to serve none.
 
 | Method | Path | Description |
 |---|---|---|

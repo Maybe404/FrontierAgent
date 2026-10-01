@@ -125,7 +125,8 @@ def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
             await runner.stop()
 
     app = FastAPI(title="FrontierAgent service", version="0.1.0", lifespan=lifespan,
-                  description=API_DESCRIPTION, openapi_tags=OPENAPI_TAGS, docs_url=None, redoc_url=None)
+                  description=API_DESCRIPTION, openapi_tags=OPENAPI_TAGS,
+                  openapi_url=None, docs_url=None, redoc_url=None)   # served by docs.mount
     app.state.store, app.state.runner, app.state.cfg = store, runner, cfg
 
     def auth(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]) -> None:
@@ -252,5 +253,5 @@ def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
-    docs.mount(app)
+    docs.mount(app, cfg)
     return app

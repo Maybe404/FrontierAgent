@@ -19,13 +19,18 @@ from __future__ import annotations
 import copy
 import json
 import re
+import secrets
+from collections.abc import Callable
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 import yaml
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+
+from agent_service.config import ServiceConfig
 
 OVERLAY_DIR = Path(__file__).parent / "openapi"
 LOCALES = {"zh-CN": "中文"}
@@ -186,7 +191,7 @@ def overlay_stub(spec: dict[str, Any], overlay: dict[str, Any]) -> str:
     return yaml.dump(stubs, Dumper=_Dumper, allow_unicode=True, sort_keys=False, width=1000)
 
 
-def _page(title: str, configs: list[dict[str, Any]]) -> str:
+def _page(title: str, configs: list[dict[str, Any]], *, try_it: bool) -> str:
     common = {
         # Both would upload the whole document to Scalar's servers.
         "agent": {"disabled": True},
@@ -194,6 +199,8 @@ def _page(title: str, configs: list[dict[str, Any]]) -> str:
         "telemetry": False,
         "withDefaultFonts": False,
         "showDeveloperTools": "never",
+        "hideTestRequestButton": not try_it,
+        "hideClientButton": not try_it,
     }
     data = json.dumps([{**common, **c} for c in configs], ensure_ascii=False).replace("</", "<\\/")
     return f"""<!doctype html>
@@ -206,29 +213,51 @@ def _page(title: str, configs: list[dict[str, Any]]) -> str:
 <body>
   <div id="app"></div>
   <script src="{_SCALAR_JS}"></script>
-  <script>Scalar.createApiReference('#app', {data})</script>
+  <script>
+    // Document URLs are relative to this page, so the docs work behind a
+    // gateway path prefix; resolving against origin + pathname also drops any
+    // user:password@ the page was opened with, which fetch() would reject.
+    const configs = {data};
+    const base = location.origin + location.pathname;
+    for (const c of configs) c.url = new URL(c.url, base).href;
+    Scalar.createApiReference('#app', configs);
+  </script>
 </body>
 </html>"""
 
 
-def mount(app: FastAPI) -> None:
-    """Serve ``/docs`` and ``/openapi.<locale>.json`` next to FastAPI's ``/openapi.json``."""
+# Module level: annotations are strings here, and FastAPI resolves them
+# against module globals, not a function's locals.
+_basic = HTTPBasic(realm="API docs")
 
-    @cache
-    def translated(locale: str) -> dict[str, Any]:
-        return apply_overlay(app.openapi(), load_overlay(locale))
 
+def _password_guard(password: str) -> Callable[..., None]:
+    def guard(credentials: Annotated[HTTPBasicCredentials, Depends(_basic)]) -> None:
+        if not secrets.compare_digest(credentials.password.encode(), password.encode()):
+            raise HTTPException(401, "invalid docs password", headers={"WWW-Authenticate": 'Basic realm="API docs"'})
+
+    return guard
+
+
+def mount(app: FastAPI, cfg: ServiceConfig) -> None:
+    """Serve ``/docs``, ``/openapi.json`` and ``/openapi.<locale>.json`` as *cfg* allows.
+
+    The app must be built with ``openapi_url=None`` so that the English
+    document gets the same switch and password as the rest."""
+    if cfg.docs == "off":
+        return
+    deps = [Depends(_password_guard(cfg.docs_password))] if cfg.docs_password else []
+
+    def route(path: str, doc: Callable[[], dict[str, Any]]) -> None:
+        app.add_api_route(path, lambda: JSONResponse(doc()), include_in_schema=False, dependencies=deps)
+
+    route("/openapi.json", app.openapi)
     for locale in LOCALES:
-        def openapi_locale(locale: str = locale) -> JSONResponse:
-            return JSONResponse(translated(locale))
+        translated = cache(lambda locale=locale: apply_overlay(app.openapi(), load_overlay(locale)))
+        route(f"/openapi.{locale}.json", translated)
 
-        app.add_api_route(f"/openapi.{locale}.json", openapi_locale, include_in_schema=False)
-
-    configs = [{"title": "English", "slug": "en", "url": "/openapi.json", "localization": {"locale": "en"}}]
-    configs += [{"title": label, "slug": locale.lower(), "url": f"/openapi.{locale}.json",
+    configs = [{"title": "English", "slug": "en", "url": "openapi.json", "localization": {"locale": "en"}}]
+    configs += [{"title": label, "slug": locale.lower(), "url": f"openapi.{locale}.json",
                  "localization": {"locale": locale}} for locale, label in LOCALES.items()]
-    html = _page(app.title, configs)
-
-    @app.get("/docs", include_in_schema=False)
-    def docs() -> HTMLResponse:
-        return HTMLResponse(html)
+    html = _page(app.title, configs, try_it=cfg.docs_try_it)
+    app.add_api_route("/docs", lambda: HTMLResponse(html), include_in_schema=False, dependencies=deps)
