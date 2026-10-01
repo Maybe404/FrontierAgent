@@ -1009,6 +1009,10 @@ sandbox = [
     { name = "openpyxl" },
     { name = "pandas" },
 ]
+service = [
+    { name = "fastapi" },
+    { name = "uvicorn" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1017,6 +1021,7 @@ requires-dist = [
     { name = "browserbase", marker = "extra == 'plugins'", specifier = ">=0.1.0" },
     { name = "datasets", marker = "extra == 'eval'", specifier = ">=4.8.4" },
     { name = "e2b-code-interpreter", marker = "extra == 'sandbox'", specifier = ">=2.6.0" },
+    { name = "fastapi", marker = "extra == 'service'", specifier = ">=0.115" },
     { name = "firecrawl-py", marker = "extra == 'plugins'", specifier = ">=1.0.0" },
     { name = "gradio", marker = "extra == 'hf-space'", specifier = ">=6.0,<7" },
     { name = "harbor", marker = "extra == 'eval'", specifier = ">=0.4.0" },
@@ -1059,8 +1064,9 @@ requires-dist = [
     { name = "trafilatura", specifier = ">=1.12" },
     { name = "types-openpyxl", marker = "extra == 'dev'" },
     { name = "types-pyyaml", marker = "extra == 'dev'" },
+    { name = "uvicorn", marker = "extra == 'service'", specifier = ">=0.30" },
 ]
-provides-extras = ["document-readers", "plugins", "sandbox", "eval", "dev", "hf-space"]
+provides-extras = ["document-readers", "plugins", "sandbox", "eval", "dev", "hf-space", "service"]
 
 [[package]]
 name = "frozenlist"
@@ -1363,8 +1369,8 @@ name = "httpcore2"
 version = "2.12.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "h11" },
-    { name = "truststore" },
+    { name = "h11", marker = "sys_platform != 'emscripten'" },
+    { name = "truststore", marker = "sys_platform != 'emscripten'" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/be/ad/f4f0e57345f1870f3e8cb624e058d7eca6e5a27d33bcc3311d9b618734cd/httpcore2-2.12.0.tar.gz", hash = "sha256:9293522bba0aa7c4c8e9e3f040c16575bd8868e155a77fa30c7a9085a5eae648", size = 67548, upload-time = "2026-08-18T13:22:08.211Z" }
 wheels = [

@@ -100,6 +100,8 @@ reference; keeping those roles separate avoids duplicating setup instructions.
 | Compare context-offloading changes with an A/B run | [Tool-result truncation A/B](tool-result-truncation-ab.md) |
 | Pick up the deferred context-offloading work | [Context offloading follow-ups](context-offloading-followups.md) |
 | Inspect release-facing changes | [Changelog](../CHANGELOG.md) |
+| Run journal, Langfuse export, retention | [Run journal](telemetry.md) |
+| HTTP task API for a backend gateway | [Agent service](service.md) |
 
 Subsystem READMEs live beside their code when they are primarily useful to
 maintainers: [`apodex/`](../apodex/README.md),

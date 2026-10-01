@@ -60,3 +60,6 @@ private/
 
 # User specific claude configurations
 .claude
+
+# agent_service data (task db, per-task workdirs)
+.service/
