@@ -30,9 +30,9 @@ exiting.
 """
 
 OPENAPI_TAGS = [
-    {"name": "tasks", "description": "Submit, query and cancel agent tasks."},
-    {"name": "results", "description": "Progress events and produced files."},
-    {"name": "system", "description": "Service health."},
+    {"name": "tasks", "x-displayName": "Tasks", "description": "Submit, query and cancel agent tasks."},
+    {"name": "results", "x-displayName": "Results", "description": "Progress events and produced files."},
+    {"name": "system", "x-displayName": "System", "description": "Service health."},
 ]
 
 

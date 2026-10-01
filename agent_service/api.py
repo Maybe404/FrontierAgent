@@ -27,7 +27,7 @@ from fastapi import Path as PathParam
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-from agent_service import engine
+from agent_service import docs, engine
 from agent_service.config import ServiceConfig
 from agent_service.runner import Runner
 from agent_service.schemas import (
@@ -125,7 +125,7 @@ def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
             await runner.stop()
 
     app = FastAPI(title="FrontierAgent service", version="0.1.0", lifespan=lifespan,
-                  description=API_DESCRIPTION, openapi_tags=OPENAPI_TAGS)
+                  description=API_DESCRIPTION, openapi_tags=OPENAPI_TAGS, docs_url=None, redoc_url=None)
     app.state.store, app.state.runner, app.state.cfg = store, runner, cfg
 
     def auth(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]) -> None:
@@ -252,4 +252,5 @@ def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
         return StreamingResponse(stream(), media_type="text/event-stream",
                                  headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
 
+    docs.mount(app)
     return app

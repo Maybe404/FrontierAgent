@@ -1,0 +1,518 @@
+# Chinese (zh-CN) translation of the service's OpenAPI document, as an OpenAPI Overlay.
+# Each action replaces summary/description at `target`; `x-source` is the English it
+# translates. When the English changes, tests report the action as stale.
+overlay: 1.0.0
+info:
+  title: FrontierAgent service API, zh-CN
+  version: 1.0.0
+actions:
+- target: $.info
+  update:
+    description: |
+      异步运行 FrontierAgent 任务。
+
+      提交任务后，可通过 Server-Sent Events（SSE）实时接收进度，或轮询任务状态。任务进入终态后，读取结果并下载它生成的文件。
+
+      **生命周期：** `queued` → `running` → `completed` | `failed` | `cancelled` | `timed_out`。`cancelling` 是发起取消到工作进程退出之间的过渡状态。
+
+      **鉴权：** 服务配置了 API token 时，所有 `/v1` 接口都需要携带 `Authorization: Bearer <token>`。
+  x-source:
+    description: |
+      Run FrontierAgent tasks asynchronously.
+
+      Submit a task, then follow its progress over Server-Sent Events or poll its
+      status. When it reaches a final status, read the answer and download the
+      files it produced.
+
+      **Lifecycle:** `queued` → `running` → `completed` | `failed` | `cancelled` | `timed_out`.
+      `cancelling` is the transient state between a cancel request and the worker
+      exiting.
+
+      **Authentication:** when the service is configured with an API token, every
+      `/v1` endpoint requires `Authorization: Bearer <token>`.
+- target: $.tags[?(@.name=='tasks')]
+  update:
+    x-displayName: 任务
+    description: 提交、查询和取消智能体任务。
+  x-source:
+    x-displayName: Tasks
+    description: Submit, query and cancel agent tasks.
+- target: $.tags[?(@.name=='results')]
+  update:
+    x-displayName: 结果与文件
+    description: 进度事件与生成的文件。
+  x-source:
+    x-displayName: Results
+    description: Progress events and produced files.
+- target: $.tags[?(@.name=='system')]
+  update:
+    x-displayName: 系统
+    description: 服务健康检查。
+  x-source:
+    x-displayName: System
+    description: Service health.
+- target: $.paths['/healthz'].get
+  update:
+    summary: 存活检查
+    description: 服务进程运行时返回 200。无需 token。
+  x-source:
+    summary: Liveness check
+    description: Returns 200 while the service process is up. Needs no token.
+- target: $.paths['/healthz'].get.responses['200']
+  update:
+    description: 成功
+  x-source:
+    description: Successful Response
+- target: $.paths['/v1/tasks'].post
+  update:
+    summary: 提交任务
+    description: |-
+      将任务加入队列并立即返回，状态为 `queued`。
+
+      按 `request_id` 幂等：重复提交会返回已有任务（`created: false`），不会再次启动。
+  x-source:
+    summary: Submit a task
+    description: |-
+      Queue a task and return immediately with status `queued`.
+
+      Idempotent on `request_id`: a repeated submit returns the existing
+      task with `created: false` and does not start it again.
+- target: $.paths['/v1/tasks'].post.responses['202']
+  update:
+    description: 成功
+  x-source:
+    description: Successful Response
+- target: $.paths['/v1/tasks'].post.responses['401']
+  update:
+    description: 缺少 bearer token 或 token 无效。
+  x-source:
+    description: Missing or invalid bearer token.
+- target: $.paths['/v1/tasks'].post.responses['413']
+  update:
+    description: '`task` 超出服务允许的长度。'
+  x-source:
+    description: '`task` is longer than the service limit.'
+- target: $.paths['/v1/tasks'].post.responses['422']
+  update:
+    description: 请求体不合法，或 `mode` 不存在。
+  x-source:
+    description: Invalid body, or unknown `mode`.
+- target: $.paths['/v1/tasks'].get
+  update:
+    summary: 任务列表
+    description: 按提交时间倒序，最新的在前。
+  x-source:
+    summary: List tasks
+    description: Most recently submitted tasks first.
+- target: $.paths['/v1/tasks'].get.parameters[?(@.name=='status')]
+  update:
+    description: 只返回处于该状态的任务。
+  x-source:
+    description: Only tasks in this status.
+- target: $.paths['/v1/tasks'].get.parameters[?(@.name=='limit')]
+  update:
+    description: 最多返回的任务数，上限 500。
+  x-source:
+    description: Maximum number of tasks to return; capped at 500.
+- target: $.paths['/v1/tasks'].get.responses['200']
+  update:
+    description: 成功
+  x-source:
+    description: Successful Response
+- target: $.paths['/v1/tasks'].get.responses['401']
+  update:
+    description: 缺少 bearer token 或 token 无效。
+  x-source:
+    description: Missing or invalid bearer token.
+- target: $.paths['/v1/tasks'].get.responses['422']
+  update:
+    description: 参数校验失败
+  x-source:
+    description: Validation Error
+- target: $.paths['/v1/tasks/{task_id}'].get
+  update:
+    summary: 查询任务
+    description: 任务状态；任务进入终态后包含结果、错误信息和交付物。
+  x-source:
+    summary: Get a task
+    description: Status of the task; answer, error and deliverables once it is final.
+- target: $.paths['/v1/tasks/{task_id}'].get.parameters[?(@.name=='task_id')]
+  update:
+    description: 提交任务时返回的任务 id。
+  x-source:
+    description: Task id returned by submit.
+- target: $.paths['/v1/tasks/{task_id}'].get.responses['200']
+  update:
+    description: 成功
+  x-source:
+    description: Successful Response
+- target: $.paths['/v1/tasks/{task_id}'].get.responses['401']
+  update:
+    description: 缺少 bearer token 或 token 无效。
+  x-source:
+    description: Missing or invalid bearer token.
+- target: $.paths['/v1/tasks/{task_id}'].get.responses['404']
+  update:
+    description: 任务不存在。
+  x-source:
+    description: No task with this id.
+- target: $.paths['/v1/tasks/{task_id}'].get.responses['422']
+  update:
+    description: 参数校验失败
+  x-source:
+    description: Validation Error
+- target: $.paths['/v1/tasks/{task_id}/cancel'].post
+  update:
+    summary: 取消任务
+    description: |-
+      通知工作进程停止，超时未退出则强制终止。
+
+      排队中的任务立即变为 `cancelled`。运行中的任务先变为 `cancelling`，工作进程退出后变为 `cancelled`。已处于终态的任务原样返回。
+  x-source:
+    summary: Cancel a task
+    description: |-
+      Ask the worker to stop, then terminate it if it does not exit in time.
+
+      A queued task becomes `cancelled` at once. A running task becomes
+      `cancelling`, then `cancelled` when its worker exits. A final task is
+      returned unchanged.
+- target: $.paths['/v1/tasks/{task_id}/cancel'].post.parameters[?(@.name=='task_id')]
+  update:
+    description: 提交任务时返回的任务 id。
+  x-source:
+    description: Task id returned by submit.
+- target: $.paths['/v1/tasks/{task_id}/cancel'].post.responses['200']
+  update:
+    description: 成功
+  x-source:
+    description: Successful Response
+- target: $.paths['/v1/tasks/{task_id}/cancel'].post.responses['401']
+  update:
+    description: 缺少 bearer token 或 token 无效。
+  x-source:
+    description: Missing or invalid bearer token.
+- target: $.paths['/v1/tasks/{task_id}/cancel'].post.responses['404']
+  update:
+    description: 任务不存在。
+  x-source:
+    description: No task with this id.
+- target: $.paths['/v1/tasks/{task_id}/cancel'].post.responses['422']
+  update:
+    description: 参数校验失败
+  x-source:
+    description: Validation Error
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get
+  update:
+    summary: 下载生成的文件
+    description: 从任务的输出目录下载文件。
+  x-source:
+    summary: Download a produced file
+    description: Download a file from the task's outputs directory.
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get.parameters[?(@.name=='task_id')]
+  update:
+    description: 提交任务时返回的任务 id。
+  x-source:
+    description: Task id returned by submit.
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get.parameters[?(@.name=='path')]
+  update:
+    description: 交付物的 `path`，与任务详情中列出的一致。
+  x-source:
+    description: A deliverable's `path`, as listed on the task.
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get.responses['200']
+  update:
+    description: 文件内容。
+  x-source:
+    description: The file content.
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get.responses['401']
+  update:
+    description: 缺少 bearer token 或 token 无效。
+  x-source:
+    description: Missing or invalid bearer token.
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get.responses['404']
+  update:
+    description: 任务不存在、任务尚无输出，或文件不存在。
+  x-source:
+    description: No such task, the task has no outputs yet, or no such file.
+- target: $.paths['/v1/tasks/{task_id}/files/{path}'].get.responses['422']
+  update:
+    description: 参数校验失败
+  x-source:
+    description: Validation Error
+- target: $.paths['/v1/tasks/{task_id}/events'].get
+  update:
+    summary: 实时接收进度事件
+    description: |-
+      任务进度的 Server-Sent Events 流，数据来自任务的运行日志（journal）。
+
+      每一帧的格式为
+      ```
+      id: <cursor>
+      event: <kind>
+      data: {"seq", "kind", "ts", "agent_id", "turn", "span_id", "parent_span_id", "data"}
+      ```
+      `kind` 是运行日志中的事件类型（例如 `run.start`、`llm.response`、`tool.call`、`tool.result`、`deliverable`、`run.end`）。`data` 中的长字符串会脱敏，并截断到 2000 个字符。
+
+      任务进入终态且所有事件都已发送后，会发送一帧 `task.end`，内容为该任务（结构同 `GET /v1/tasks/{task_id}`），随后关闭连接。空闲时每 15 秒发送一行注释（`: keepalive`）保活。
+
+      **断点续传：** 重连时带上 `Last-Event-ID` 请求头（浏览器会自动带上），或使用 `?after=<cursor>`，只接收之后的事件。
+  x-source:
+    summary: Stream progress events
+    description: |-
+      Server-Sent Events stream of the task's progress, read from its run journal.
+
+      Each frame is
+      ```
+      id: <cursor>
+      event: <kind>
+      data: {"seq", "kind", "ts", "agent_id", "turn", "span_id", "parent_span_id", "data"}
+      ```
+      `kind` is the journal event kind (for example `run.start`, `llm.response`,
+      `tool.call`, `tool.result`, `deliverable`, `run.end`). Long strings in `data`
+      are redacted and truncated to 2000 characters.
+
+      When the task is final and all events were sent, one `task.end` frame carries
+      the task (same shape as `GET /v1/tasks/{task_id}`) and the stream closes.
+      Comment lines (`: keepalive`) are sent every 15 s while idle.
+
+      **Resuming:** reconnect with the `Last-Event-ID` header (browsers do this
+      automatically) or `?after=<cursor>` to receive only later events.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.parameters[?(@.name=='task_id')]
+  update:
+    description: 提交任务时返回的任务 id。
+  x-source:
+    description: Task id returned by submit.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.parameters[?(@.name=='after')]
+  update:
+    description: 只发送该游标之后的事件。
+  x-source:
+    description: Send only events after this cursor.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.parameters[?(@.name=='last-event-id')]
+  update:
+    description: 最后收到的事件游标；优先于 `after`。
+  x-source:
+    description: Cursor of the last event received; overrides `after`.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.responses['200']
+  update:
+    description: 事件流。
+  x-source:
+    description: Event stream.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.responses['401']
+  update:
+    description: 缺少 bearer token 或 token 无效。
+  x-source:
+    description: Missing or invalid bearer token.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.responses['404']
+  update:
+    description: 任务不存在。
+  x-source:
+    description: No task with this id.
+- target: $.paths['/v1/tasks/{task_id}/events'].get.responses['422']
+  update:
+    description: 参数校验失败
+  x-source:
+    description: Validation Error
+- target: $.components.schemas.Deliverable
+  update:
+    description: 智能体生成的文件。通过 `/v1/tasks/{task_id}/files/{path}` 下载。
+  x-source:
+    description: A file the agent produced. Download it from `/v1/tasks/{task_id}/files/{path}`.
+- target: $.components.schemas.Deliverable.properties.path
+  update:
+    description: 相对于任务输出目录的路径。
+  x-source:
+    description: Path relative to the task's outputs directory.
+- target: $.components.schemas.Deliverable.properties.bytes
+  update:
+    description: 文件大小（字节）。
+  x-source:
+    description: File size in bytes.
+- target: $.components.schemas.Deliverable.properties.sha256
+  update:
+    description: 文件内容的 SHA-256，十六进制编码。
+  x-source:
+    description: SHA-256 of the file content, hex encoded.
+- target: $.components.schemas.Deliverable.properties.media_type
+  update:
+    description: 文件的 MIME 类型。
+  x-source:
+    description: MIME type of the file.
+- target: $.components.schemas.Deliverable.properties.error
+  update:
+    description: 文件未能记录的原因；记录成功时为 null。
+  x-source:
+    description: Why the file could not be recorded; null when it was.
+- target: $.components.schemas.ErrorResponse.properties.detail
+  update:
+    description: 错误信息。
+  x-source:
+    description: Error message.
+- target: $.components.schemas.Health.properties.status
+  update:
+    description: 服务运行时始终为 `ok`。
+  x-source:
+    description: Always `ok` while the service is up.
+- target: $.components.schemas.SubmitRequest.properties.task
+  update:
+    description: 交给智能体的任务，用自然语言描述。长度上限由服务配置 `SERVICE_MAX_TASK_CHARS` 决定（超出返回 413）。
+  x-source:
+    description: The task for the agent, in natural language. Length is capped by the service setting `SERVICE_MAX_TASK_CHARS` (413 when exceeded).
+- target: $.components.schemas.SubmitRequest.properties.mode
+  update:
+    description: 智能体模式，可选 `react`、`agent_team`、`research`、`coding`。不传则使用服务默认值（`SERVICE_DEFAULT_MODE`）。
+  x-source:
+    description: Agent mode, one of `react`, `agent_team`, `research`, `coding`. Omit to use the service default (`SERVICE_DEFAULT_MODE`).
+- target: $.components.schemas.SubmitRequest.properties.request_id
+  update:
+    description: '调用方自定义的幂等键。再次提交相同的 `request_id` 会返回已有任务（`created: false`），不会新建任务。不传时默认等于任务 id。'
+  x-source:
+    description: 'Caller-chosen idempotency key. Submitting the same `request_id` again returns the existing task (`created: false`) instead of starting a new one. Defaults to the task id when omitted.'
+- target: $.components.schemas.SubmitRequest.properties.max_turns
+  update:
+    description: 智能体轮次上限。不传则使用智能体自身的默认值。
+  x-source:
+    description: Upper bound on agent turns. Omit to use the agent's own default.
+- target: $.components.schemas.SubmitResponse.properties.id
+  update:
+    description: 服务分配的任务 id。
+  x-source:
+    description: Task id assigned by the service.
+- target: $.components.schemas.SubmitResponse.properties.request_id
+  update:
+    description: 幂等键：调用方传入的 `request_id`；未传时为任务 id。
+  x-source:
+    description: 'Idempotency key: the caller''s `request_id`, or the task id when none was given.'
+- target: $.components.schemas.SubmitResponse.properties.mode
+  update:
+    description: 任务运行所用的智能体模式。
+  x-source:
+    description: Agent mode the task runs in.
+- target: $.components.schemas.SubmitResponse.properties.status
+  update:
+    description: 当前生命周期状态。
+  x-source:
+    description: Current lifecycle status.
+- target: $.components.schemas.SubmitResponse.properties.created_at
+  update:
+    description: 任务提交时间（ISO 8601，UTC）。
+  x-source:
+    description: When the task was submitted (ISO 8601, UTC).
+- target: $.components.schemas.SubmitResponse.properties.started_at
+  update:
+    description: 工作进程开始运行的时间（ISO 8601，UTC）；排队中为 null。
+  x-source:
+    description: When a worker started running it (ISO 8601, UTC); null while queued.
+- target: $.components.schemas.SubmitResponse.properties.finished_at
+  update:
+    description: 任务进入终态的时间（ISO 8601，UTC）；此前为 null。
+  x-source:
+    description: When it reached a final status (ISO 8601, UTC); null until then.
+- target: $.components.schemas.SubmitResponse.properties.answer
+  update:
+    description: 智能体的最终回答。任务进入终态后写入；未完成的任务可能只有部分内容或为空。
+  x-source:
+    description: The agent's final answer. Set once the task is final; may be partial or empty for tasks that did not complete.
+- target: $.components.schemas.SubmitResponse.properties.error
+  update:
+    description: 便于阅读的失败原因；已完成的任务为 null。
+  x-source:
+    description: Human-readable failure reason; null for completed tasks.
+- target: $.components.schemas.SubmitResponse.properties.error_code
+  update:
+    description: 供程序分支判断的失败原因：`llm_error`、`incomplete`、`agent_error`、`worker_crashed`、`timeout`、`cancelled`、`service_restart`、`internal`。仅在任务失败、超时或被取消时有值，否则为 null。今后可能新增取值。
+  x-source:
+    description: 'Machine-readable failure reason for branching: `llm_error`, `incomplete`, `agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_restart`, `internal`. Null unless the task failed, timed out or was cancelled. New codes may be added.'
+- target: $.components.schemas.SubmitResponse.properties.complete
+  update:
+    description: 智能体是否报告任务已全部完成；进入终态前为 null。
+  x-source:
+    description: Whether the agent reported the task as fully done; null until final.
+- target: $.components.schemas.SubmitResponse.properties.deliverables
+  update:
+    description: 智能体生成的文件，按生成顺序排列。
+  x-source:
+    description: Files the agent produced, in creation order.
+- target: $.components.schemas.SubmitResponse.properties.exit_code
+  update:
+    description: 工作进程的退出码；未正常退出时为 null。
+  x-source:
+    description: Exit code of the worker process; null if it never exited normally.
+- target: $.components.schemas.SubmitResponse.properties.created
+  update:
+    description: 本次调用新建了任务时为 true；`request_id` 与已有任务重复、原样返回已有任务时为 false。
+  x-source:
+    description: True when this call created the task; false when `request_id` matched an existing task, which is returned unchanged.
+- target: $.components.schemas.Task.properties.id
+  update:
+    description: 服务分配的任务 id。
+  x-source:
+    description: Task id assigned by the service.
+- target: $.components.schemas.Task.properties.request_id
+  update:
+    description: 幂等键：调用方传入的 `request_id`；未传时为任务 id。
+  x-source:
+    description: 'Idempotency key: the caller''s `request_id`, or the task id when none was given.'
+- target: $.components.schemas.Task.properties.mode
+  update:
+    description: 任务运行所用的智能体模式。
+  x-source:
+    description: Agent mode the task runs in.
+- target: $.components.schemas.Task.properties.status
+  update:
+    description: 当前生命周期状态。
+  x-source:
+    description: Current lifecycle status.
+- target: $.components.schemas.Task.properties.created_at
+  update:
+    description: 任务提交时间（ISO 8601，UTC）。
+  x-source:
+    description: When the task was submitted (ISO 8601, UTC).
+- target: $.components.schemas.Task.properties.started_at
+  update:
+    description: 工作进程开始运行的时间（ISO 8601，UTC）；排队中为 null。
+  x-source:
+    description: When a worker started running it (ISO 8601, UTC); null while queued.
+- target: $.components.schemas.Task.properties.finished_at
+  update:
+    description: 任务进入终态的时间（ISO 8601，UTC）；此前为 null。
+  x-source:
+    description: When it reached a final status (ISO 8601, UTC); null until then.
+- target: $.components.schemas.Task.properties.answer
+  update:
+    description: 智能体的最终回答。任务进入终态后写入；未完成的任务可能只有部分内容或为空。
+  x-source:
+    description: The agent's final answer. Set once the task is final; may be partial or empty for tasks that did not complete.
+- target: $.components.schemas.Task.properties.error
+  update:
+    description: 便于阅读的失败原因；已完成的任务为 null。
+  x-source:
+    description: Human-readable failure reason; null for completed tasks.
+- target: $.components.schemas.Task.properties.error_code
+  update:
+    description: 供程序分支判断的失败原因：`llm_error`、`incomplete`、`agent_error`、`worker_crashed`、`timeout`、`cancelled`、`service_restart`、`internal`。仅在任务失败、超时或被取消时有值，否则为 null。今后可能新增取值。
+  x-source:
+    description: 'Machine-readable failure reason for branching: `llm_error`, `incomplete`, `agent_error`, `worker_crashed`, `timeout`, `cancelled`, `service_restart`, `internal`. Null unless the task failed, timed out or was cancelled. New codes may be added.'
+- target: $.components.schemas.Task.properties.complete
+  update:
+    description: 智能体是否报告任务已全部完成；进入终态前为 null。
+  x-source:
+    description: Whether the agent reported the task as fully done; null until final.
+- target: $.components.schemas.Task.properties.deliverables
+  update:
+    description: 智能体生成的文件，按生成顺序排列。
+  x-source:
+    description: Files the agent produced, in creation order.
+- target: $.components.schemas.Task.properties.exit_code
+  update:
+    description: 工作进程的退出码；未正常退出时为 null。
+  x-source:
+    description: Exit code of the worker process; null if it never exited normally.
+- target: $.components.schemas.TaskList.properties.data
+  update:
+    description: 任务列表，最新的在前。
+  x-source:
+    description: Tasks, newest first.
+- target: $.components.securitySchemes.HTTPBearer
+  update:
+    description: 服务配置的 `SERVICE_API_TOKEN`。
+  x-source:
+    description: The service's `SERVICE_API_TOKEN`.
