@@ -250,6 +250,7 @@ class TaskRunnerMixin:
             session_id=self.session_id,
             task=task,
             workflow=self.mode,
+            outputs_dir=run_dir(self.session_id) / "outputs",
         ):
             await self._run_task(task)
 

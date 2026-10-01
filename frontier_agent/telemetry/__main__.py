@@ -5,8 +5,13 @@
     python -m frontier_agent.telemetry check   <run_dir>
     python -m frontier_agent.telemetry export  <run_dir> [--resend]
     python -m frontier_agent.telemetry verify  <run_dir>
+    python -m frontier_agent.telemetry recover <run_dir>
+    python -m frontier_agent.telemetry archive <runs_root> --archive-root DIR [--older-than-days N]
+    python -m frontier_agent.telemetry prune   <runs_root> --archive-root DIR [--older-than-days N]
+                                               [--max-gb G] [--force] [--dry-run]
 
-``<run_dir>`` is ``<cwd>/.apodex/runs/<session-id>``.
+``<run_dir>`` is ``<cwd>/.apodex/runs/<session-id>``; ``<runs_root>`` is
+``<cwd>/.apodex/runs``.
 """
 
 from __future__ import annotations
@@ -100,15 +105,56 @@ async def verify(run_dir: Path) -> int:
     return 1 if bad else 0
 
 
+def retention(a: argparse.Namespace) -> int:
+    import time
+
+    from frontier_agent.telemetry import retention as rt
+
+    store = rt.LocalArchive(a.archive_root)
+    runs = rt.scan(a.run_dir)
+    cutoff = time.time() - a.older_than_days * 86400
+    if a.command == "archive":
+        for info in runs:
+            if info.open or info.mtime >= cutoff or rt.is_archived(info, store):
+                continue
+            name, digest = rt.archive_run(info, store, a.archive_root / ".tmp")
+            print(f"archived {info.path.name} -> {name} ({digest[:12]})")
+        return 0
+    max_bytes = int(a.max_gb * 1024 ** 3) if a.max_gb is not None else None
+    failed = 0
+    for info in rt.select_for_prune(runs, older_than_days=a.older_than_days, max_total_bytes=max_bytes):
+        if not a.force and not rt.is_archived(info, store):
+            print(f"skip {info.path.name}: not archived (run archive first, or --force)")
+            failed += 1
+            continue
+        print(f"{'would delete' if a.dry_run else 'delete'} {info.path.name} ({info.bytes / 1e6:.1f} MB)")
+        if not a.dry_run:
+            import shutil
+
+            shutil.rmtree(info.path)
+    return 1 if failed else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="python -m frontier_agent.telemetry")
-    p.add_argument("command", choices=["runs", "show", "check", "export", "verify"])
+    p.add_argument("command", choices=[
+        "runs", "show", "check", "export", "verify", "recover", "archive", "prune"])
     p.add_argument("run_dir", type=Path)
+    p.add_argument("--archive-root", type=Path, default=None)
+    p.add_argument("--older-than-days", type=float, default=7.0)
+    p.add_argument("--max-gb", type=float, default=None)
+    p.add_argument("--force", action="store_true", help="prune: delete even if not archived")
+    p.add_argument("--dry-run", action="store_true")
     p.add_argument("--run", default=None, help="run id (default: all runs in the directory)")
     p.add_argument("--full", action="store_true", help="show: print full event data")
     p.add_argument("--resend", action="store_true", help="export: resend spans already sent (Langfuse keeps both copies; debugging only)")
     a = p.parse_args(argv)
 
+    if a.command in ("archive", "prune"):
+        if a.archive_root is None:
+            print("--archive-root is required", file=sys.stderr)
+            return 2
+        return retention(a)
     if not (a.run_dir / "journal.db").exists():
         print(f"no journal.db in {a.run_dir}", file=sys.stderr)
         return 2
@@ -124,6 +170,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if a.command == "check":
         return check(a.run_dir)
+    if a.command == "recover":
+        from frontier_agent.telemetry.run import recover_stale
+
+        rid = asyncio.run(recover_stale(a.run_dir))
+        print(f"closed crashed run {rid}" if rid else "nothing to recover")
+        return 0
     if not lf.configured():
         print("set LANGFUSE_HOST, LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY", file=sys.stderr)
         return 2

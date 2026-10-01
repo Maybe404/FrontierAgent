@@ -194,3 +194,119 @@ def test_check_command_flags_missing_run_end(tmp_path: Path, capsys) -> None:
     asyncio.run(_one_turn_run(tmp_path, finish=False))
     assert check(tmp_path) == 1
     assert "NO run.end" in capsys.readouterr().out
+
+
+async def test_stale_lock_from_dead_process_gets_synthetic_run_end(tmp_path: Path) -> None:
+    from frontier_agent.telemetry.run import recover_stale
+
+    run = await _one_turn_run(tmp_path, finish=False)
+    lock = json.loads((tmp_path / "run.lock").read_text())
+    lock["pid"] = 2 ** 22 + 12345          # no such process
+    (tmp_path / "run.lock").write_text(json.dumps(lock))
+
+    assert await recover_stale(tmp_path) == run.run_id
+    end = _entries(run)[-1]
+    assert end["kind"] == "run.end"
+    assert end["data"]["status"] == "crashed" and end["data"]["synthetic"] is True
+    assert end["seq"] == _entries(run)[-2]["seq"] + 1
+    assert not (tmp_path / "run.lock").exists()
+    assert await recover_stale(tmp_path) is None
+
+
+async def test_live_lock_is_left_alone(tmp_path: Path) -> None:
+    from frontier_agent.telemetry.run import recover_stale
+
+    await _one_turn_run(tmp_path, finish=False)       # lock holds our own pid
+    assert await recover_stale(tmp_path) is None
+    assert (tmp_path / "run.lock").exists()
+
+
+async def test_deliverables_and_final_answer_are_journaled(tmp_path: Path) -> None:
+    outputs = tmp_path / "outputs"
+    (outputs / "sub").mkdir(parents=True)
+    (outputs / "report.md").write_text("# 报告\n结论", encoding="utf-8")
+    (outputs / "sub" / "data.csv").write_text("a,b\n1,2\n", encoding="utf-8")
+
+    async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t", outputs_dir=outputs) as run:
+        obs = with_telemetry([])[0]
+        await obs.on_loop_start(LoopConfig(role_id="main"))
+        await obs.on_loop_end(AgentLoopResult(messages=[], final_content="最终答案", stopped_by="no_tool"))
+
+    entries = _entries(run)
+    files = {e["data"]["path"]: e["data"] for e in entries if e["kind"] == "deliverable"}
+    assert set(files) == {"report.md", "sub/data.csv"}
+    assert lf.blob_text(tmp_path, files["report.md"]["sha256"]) == "# 报告\n结论"
+    assert entries[-1]["kind"] == "run.end"
+    assert entries[-1]["data"]["output"] == "最终答案"
+
+
+def test_redaction_masks_secrets_and_personal_data(monkeypatch) -> None:
+    from frontier_agent.telemetry import redact as rd
+
+    monkeypatch.setenv("SOME_SERVICE_TOKEN", "tok-0123456789abcdef")
+    rd._env_secrets.cache_clear()
+    text = ("key sk-abcdefghijklmnop1234 auth Bearer abcdefghijklmnopqrstuv "
+            "mail a.b@example.com tel 13812345678 id 11010519491231002X "
+            "env tok-0123456789abcdef ok 2026")
+    out = rd.redact(text)
+    for leaked in ("sk-abcdefghijklmnop1234", "abcdefghijklmnopqrstuv", "a.b@example.com",
+                   "13812345678", "11010519491231002X", "tok-0123456789abcdef"):
+        assert leaked not in out
+    assert out.endswith("ok 2026")
+    rd._env_secrets.cache_clear()
+
+
+def test_archive_then_prune_only_deletes_archived_closed_runs(tmp_path: Path) -> None:
+    import os
+    import time
+
+    from frontier_agent.telemetry import retention as rt
+
+    root = tmp_path / "runs"
+    for name in ("old", "open", "new"):
+        (root / name).mkdir(parents=True)
+        (root / name / "journal.db").write_bytes(b"x" * 100)
+    (root / "open" / "run.lock").write_text("{}")
+    old = time.time() - 30 * 86400
+    for name in ("old", "open"):
+        os.utime(root / name / "journal.db", (old, old))
+
+    store = rt.LocalArchive(tmp_path / "archive")
+    runs = rt.scan(root)
+    chosen = rt.select_for_prune(runs, older_than_days=7, max_total_bytes=None)
+    assert [r.path.name for r in chosen] == ["old"]
+    assert not rt.is_archived(chosen[0], store)
+    rt.archive_run(chosen[0], store, tmp_path / "tmp")
+    assert rt.is_archived(chosen[0], store)
+    assert list((tmp_path / "archive").rglob("old.tar.gz"))
+
+
+async def test_stress_100_agents_concurrently(tmp_path: Path) -> None:
+    """100 sub-agents x 30 events through real observers: gap-free, ordered, fast enough."""
+    import time
+
+    async with telemetry_run(run_dir=tmp_path, session_id="s1", task="stress") as run:
+        main = with_telemetry([])[0]
+        await main.on_loop_start(LoopConfig(role_id="main"))
+
+        async def sub_agent(i: int) -> None:
+            obs = with_telemetry([])[0]
+            await obs.on_loop_start(LoopConfig(role_id=f"sub{i}", task_id=f"job{i}"))
+            for turn in range(1, 11):
+                await obs.on_llm_input(_ctx(turn=turn, messages=[{"role": "user", "content": f"q{i}"}]))
+                await obs.on_llm_response(_ctx(turn=turn))
+            await obs.on_loop_end(AgentLoopResult(messages=[], stopped_by="done"))
+
+        started = time.monotonic()
+        await asyncio.gather(*(asyncio.create_task(sub_agent(i)) for i in range(100)))
+        elapsed = time.monotonic() - started
+        await main.on_loop_end(AgentLoopResult(messages=[], stopped_by="done"))
+
+    entries = _entries(run)
+    assert [e["seq"] for e in entries] == list(range(1, len(entries) + 1))
+    assert entries[-1]["data"]["complete"] is True
+    starts = [e for e in entries if e["kind"] == "loop.start"]
+    assert len(starts) == 101
+    assert {e["parent_span_id"] for e in starts[1:]} == {main.span_id}
+    # 100 agents x 22 events; generous bound, catches lock-contention regressions.
+    assert elapsed < 60, f"journaling 2200 events took {elapsed:.1f}s"

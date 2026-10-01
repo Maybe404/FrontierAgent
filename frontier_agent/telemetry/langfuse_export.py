@@ -29,6 +29,8 @@ from typing import Any
 
 import httpx
 
+from frontier_agent.telemetry.redact import redact
+
 logger = logging.getLogger(__name__)
 
 _BATCH = 200
@@ -99,7 +101,8 @@ def _cap(text: str) -> str:
 
 
 def _js(value: Any) -> str:
-    return _cap(value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str))
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return _cap(redact(text))
 
 
 # -- export state --------------------------------------------------------------
@@ -169,8 +172,10 @@ def build_spans(run_dir: Path, entries: list[dict[str, Any]], *, final: bool) ->
         elif kind == "run.end" and "run" in spans:
             s = spans["run"]
             s.end = ts
-            s.attrs[f"{obs}output"] = _js({"status": d.get("status"), "error": d.get("error"),
+            s.attrs[f"{obs}output"] = _js({"answer": _resolve(run_dir, d.get("output")),
+                                           "status": d.get("status"), "error": d.get("error"),
                                            "complete": d.get("complete"),
+                                           "synthetic": d.get("synthetic"),
                                            "telemetry_errors": d.get("telemetry_errors")})
             if d.get("status") != "completed":
                 s.error = d.get("error") or d.get("status") or "not completed"
@@ -246,6 +251,19 @@ def build_spans(run_dir: Path, entries: list[dict[str, Any]], *, final: bool) ->
             s.attrs[f"{obs}metadata.duration_ms"] = str(d.get("duration_ms", ""))
             if d.get("is_error"):
                 s.error = d.get("error_kind") or "tool error"
+        elif kind == "deliverable":
+            key = f"deliverable:{e['entry_id']}"
+            preview = ""
+            if d.get("sha256") and str(d.get("media_type", "")).startswith(("text/", "application/json")):
+                preview = blob_text(run_dir, d["sha256"])
+            spans[key] = _Span(key, _hex16("deliverable", e["entry_id"]), span,
+                               f"deliverable:{d.get('path')}", ts, end=ts, attrs={
+                f"{obs}type": "event",
+                f"{obs}output": _js(preview or {k: d.get(k) for k in ("path", "bytes", "sha256")}),
+                f"{obs}metadata.path": d.get("path") or "",
+                f"{obs}metadata.bytes": str(d.get("bytes", "")),
+                f"{obs}metadata.sha256": d.get("sha256") or "",
+            }, error=d.get("error") or "")
         elif kind in ("observer.intervention", "context.compact", "context.compacted"):
             key = f"event:{e['entry_id']}"
             name = f"intervention:{d.get('observer')}" if kind == "observer.intervention" else kind

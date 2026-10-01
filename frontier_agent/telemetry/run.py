@@ -12,8 +12,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import contextvars
+import hashlib
 import json
 import logging
+import mimetypes
 import os
 import socket
 import time
@@ -33,6 +35,8 @@ SCHEMA = "fa.event/v1"
 # Strings longer than this move out of the row into a blob.
 INLINE_LIMIT = 8 * 1024
 _WRITE_ATTEMPTS = 3
+# Deliverables up to this size are copied into the journal's blob store.
+DELIVERABLE_BLOB_LIMIT = 50 * 1024 * 1024
 
 current_run: contextvars.ContextVar[TelemetryRun | None] = contextvars.ContextVar(
     "fa_telemetry_run", default=None,
@@ -95,6 +99,8 @@ class TelemetryRun:
         self._lock = asyncio.Lock()
         self._seq = 0
         self.errors = 0
+        # Set by the top-level agent's loop.end; reported on run.end.
+        self.final_output = ""
         self.lost_seqs: list[int] = []
         self._started_mono = time.monotonic()
 
@@ -193,10 +199,33 @@ class TelemetryRun:
             "env": {k: os.environ[k] for k in _ENV_KEYS if os.environ.get(k)},
         }, span_id=self.root_span_id)
 
-    async def end(self, *, status: str, output: str = "", error: str = "") -> None:
+    async def record_outputs(self, outputs_dir: Path) -> None:
+        """Journal every deliverable file: name, size, hash and content."""
+        if not outputs_dir.is_dir():
+            return
+        for path in sorted(p for p in outputs_dir.rglob("*") if p.is_file()):
+            rel = str(path.relative_to(outputs_dir))
+            try:
+                size = path.stat().st_size
+                info: dict[str, Any] = {"path": rel, "bytes": size,
+                                        "media_type": mimetypes.guess_type(rel)[0] or ""}
+                refs: dict[str, BlobRef] = {}
+                if size <= DELIVERABLE_BLOB_LIMIT:
+                    ref = await self.put_blob(path.read_bytes(), info["media_type"] or "application/octet-stream")
+                    refs["content"] = ref
+                    info["sha256"] = ref.digest
+                else:
+                    info["sha256"] = await asyncio.to_thread(_sha256_file, path)
+                    info["content"] = "not stored: larger than the deliverable blob limit"
+                await self.emit("deliverable", info, span_id=self.root_span_id, blobs=refs)
+            except OSError as exc:
+                await self.emit("deliverable", {"path": rel, "error": str(exc)},
+                                span_id=self.root_span_id)
+
+    async def end(self, *, status: str, output: str | None = None, error: str = "") -> None:
         await self.emit("run.end", {
             "status": status,
-            "output": output,
+            "output": self.final_output if output is None else output,
             "error": error,
             "duration_ms": round((time.monotonic() - self._started_mono) * 1000),
             "events": self._seq + 1,
@@ -206,6 +235,69 @@ class TelemetryRun:
         }, span_id=self.root_span_id)
         with contextlib.suppress(OSError):
             (self.run_dir / "run.lock").unlink(missing_ok=True)
+
+
+def _sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+async def recover_stale(run_dir: Path) -> str | None:
+    """Close a run whose process died without writing run.end.
+
+    ``run.lock`` names the owning pid; when that process is gone the run gets
+    a synthetic ``run.end`` (status ``crashed``) so it is never left open.
+    Returns the recovered run id, if any.
+    """
+    lock = run_dir / "run.lock"
+    try:
+        info = json.loads(lock.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if info.get("host") == socket.gethostname() and _pid_alive(int(info.get("pid", 0))):
+        return None
+    run_id = str(info.get("run_id") or "")
+    db = run_dir / "journal.db"
+    import sqlite3
+
+    with contextlib.closing(sqlite3.connect(db)) as con:
+        rows = con.execute(
+            "SELECT session_id, payload_json, kind FROM context_journal WHERE run_id=? ORDER BY sequence",
+            (run_id,),
+        ).fetchall()
+    if not rows:
+        lock.unlink(missing_ok=True)
+        return None
+    if any(r[2] == "run.end" for r in rows):
+        lock.unlink(missing_ok=True)
+        return None
+    session_id, first = rows[0][0], json.loads(rows[0][1])
+    last = json.loads(rows[-1][1])
+    run = TelemetryRun(run_dir, session_id=session_id, run_id=run_id)
+    run.trace_id, run.root_span_id = first["trace_id"], first["span_id"]
+    run._seq = int(last["seq"])
+    await run.emit("run.end", {
+        "status": "crashed",
+        "synthetic": True,
+        "error": f"process {info.get('pid')} on {info.get('host')} exited without closing the run",
+        "last_event_ts": last.get("ts"),
+        "complete": False,
+    }, span_id=run.root_span_id)
+    lock.unlink(missing_ok=True)
+    return run_id
 
 
 # Deployment identity worth stamping on every run (set by CI/CD or K8S).

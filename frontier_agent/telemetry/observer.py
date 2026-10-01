@@ -198,6 +198,8 @@ class TelemetryObserver(BaseObserver):
             "tool_calls": result.tool_calls_count,
             "final_content": result.final_content or "",
         })
+        if self.parent_span_id == self.run.root_span_id:
+            self.run.final_output = result.final_content or ""
         self._reset_span()
 
     async def on_loop_cancelled(self) -> None:

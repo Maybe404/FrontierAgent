@@ -9,7 +9,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from frontier_agent.telemetry.run import TelemetryRun, current_run, enabled
+from frontier_agent.telemetry.run import TelemetryRun, current_run, enabled, recover_stale
 
 logger = logging.getLogger(__name__)
 
@@ -22,14 +22,20 @@ async def telemetry_run(
     task: str,
     workflow: str = "",
     config: dict[str, Any] | None = None,
+    outputs_dir: Path | None = None,
 ) -> AsyncIterator[TelemetryRun | None]:
     """Journal everything the agents do inside the block.
 
-    Nested use (a task that re-enters ``run_task``) joins the outer run.
+    Nested use (a task that re-enters ``run_task``) joins the outer run. On
+    exit the files in *outputs_dir* are journaled as deliverables.
     """
     if not enabled() or current_run.get() is not None:
         yield current_run.get()
         return
+    with contextlib.suppress(Exception):
+        recovered = await recover_stale(Path(run_dir))
+        if recovered:
+            logger.warning("telemetry: closed run %s left open by a dead process", recovered)
     run = TelemetryRun(run_dir, session_id=session_id, workflow=workflow)
     try:
         await run.start(task=task, config=config)
@@ -42,7 +48,7 @@ async def telemetry_run(
     exporter = _start_exporter(run)
     try:
         yield run
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, KeyboardInterrupt):
         status = "cancelled"
         raise
     except BaseException as exc:
@@ -50,6 +56,9 @@ async def telemetry_run(
         raise
     finally:
         current_run.reset(token)
+        if outputs_dir is not None:
+            with contextlib.suppress(Exception):
+                await asyncio.shield(run.record_outputs(Path(outputs_dir)))
         with contextlib.suppress(Exception):
             await asyncio.shield(run.end(status=status, error=error))
         if exporter is not None:
