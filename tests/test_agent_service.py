@@ -204,3 +204,35 @@ def test_restart_never_signals_a_process_that_is_not_our_worker(tmp_path: Path) 
     from agent_service.runner import _is_our_worker
 
     assert _is_our_worker(os.getpid(), tmp_path / "not-in-my-cmdline") is False
+
+
+def test_missing_token_is_rejected(client) -> None:
+    r = client.post("/v1/tasks", json={"task": "x"}, headers={"Authorization": ""})
+    assert r.status_code == 401
+
+
+def test_task_status_enum_matches_store() -> None:
+    from typing import get_args
+
+    from agent_service.schemas import TaskStatus
+    from agent_service.store import ACTIVE, FINAL
+
+    assert set(get_args(TaskStatus)) == {*ACTIVE, *FINAL}
+
+
+def test_openapi_documents_every_operation_and_field(client) -> None:
+    spec = client.get("/openapi.json").json()
+    assert spec["info"]["description"]
+    assert "HTTPBearer" in spec["components"]["securitySchemes"]
+    for path, ops in spec["paths"].items():
+        for method, op in ops.items():
+            where = f"{method.upper()} {path}"
+            assert op.get("summary") and op.get("description"), where
+            assert op.get("tags"), where
+            for p in op.get("parameters", []):
+                assert p.get("description"), f"{where} parameter {p['name']}"
+    for name in ("SubmitRequest", "SubmitResponse", "Task", "TaskList", "Deliverable", "Health", "ErrorResponse"):
+        for field, schema in spec["components"]["schemas"][name]["properties"].items():
+            assert schema.get("description"), f"{name}.{field}"
+    ok = spec["paths"]["/v1/tasks/{task_id}"]["get"]["responses"]["200"]["content"]["application/json"]
+    assert ok["schema"]["$ref"].endswith("/Task")
