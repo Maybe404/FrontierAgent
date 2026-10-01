@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -111,8 +112,13 @@ def _sse_event(e: dict[str, Any]) -> str:
     return f"id: {e['cursor']}\nevent: {e['kind']}\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
 
 
-def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
+def create_app(cfg: ServiceConfig | None = None, *, allow_no_auth: bool = False) -> FastAPI:
+    """Build the app. Without ``SERVICE_API_TOKEN`` it refuses to build unless
+    *allow_no_auth* (``__main__`` passes it for loopback binds) or
+    ``SERVICE_ALLOW_NO_AUTH=1``: workers auto-approve every tool."""
     cfg = cfg or ServiceConfig.from_env()
+    if not cfg.api_token and not (allow_no_auth or os.getenv("SERVICE_ALLOW_NO_AUTH") == "1"):
+        raise RuntimeError("SERVICE_API_TOKEN is required (set SERVICE_ALLOW_NO_AUTH=1 for local use)")
     store = TaskStore(cfg.db_path)
     runner = Runner(store, cfg)
 
@@ -122,12 +128,14 @@ def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
         try:
             yield
         finally:
+            app.state.stopping.set()
             await runner.stop()
 
     app = FastAPI(title="FrontierAgent service", version="0.1.0", lifespan=lifespan,
                   description=API_DESCRIPTION, openapi_tags=OPENAPI_TAGS,
                   openapi_url=None, docs_url=None, redoc_url=None)   # served by docs.mount
     app.state.store, app.state.runner, app.state.cfg = store, runner, cfg
+    app.state.stopping = asyncio.Event()
 
     def auth(credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)]) -> None:
         if not cfg.api_token:
@@ -232,7 +240,7 @@ def create_app(cfg: ServiceConfig | None = None) -> FastAPI:
         async def stream() -> AsyncIterator[str]:
             nonlocal cursor
             idle = 0.0
-            while not await request.is_disconnected():
+            while not await request.is_disconnected() and not app.state.stopping.is_set():
                 row = store.get(task_id) or {}
                 batch = await asyncio.to_thread(engine.read_events, Path(row["workdir"]), cursor)
                 for e in batch:

@@ -177,7 +177,7 @@ def test_timeout_is_reported_as_timed_out(tmp_path: Path, monkeypatch) -> None:
                         lambda *, task, mode, workdir, max_turns: [sys.executable, str(script), str(workdir), task])
     cfg = ServiceConfig(data_dir=tmp_path / "svc", api_token="", max_concurrency=1,
                         task_timeout_s=2, cancel_grace_s=5, default_mode="react", max_task_chars=1000)
-    with TestClient(create_app(cfg)) as c:
+    with TestClient(create_app(cfg, allow_no_auth=True)) as c:
         task_id = c.post("/v1/tasks", json={"task": "sleep long"}).json()["id"]
         row = _wait(c, task_id)
     assert row["status"] == "timed_out" and row["error_code"] == "timeout"
@@ -236,3 +236,310 @@ def test_openapi_documents_every_operation_and_field(client) -> None:
             assert schema.get("description"), f"{name}.{field}"
     ok = spec["paths"]["/v1/tasks/{task_id}"]["get"]["responses"]["200"]["content"]["application/json"]
     assert ok["schema"]["$ref"].endswith("/Task")
+
+
+def test_worker_process_does_not_reload_a_parent_dotenv(tmp_path: Path) -> None:
+    """The allowlist must hold inside the real worker: the CLI's .env loader
+    walks up from the task dir, so put a poisoned .env above it."""
+    import subprocess
+
+    (tmp_path / ".env").write_text("SERVICE_API_TOKEN=leaked\nLANGFUSE_SECRET_KEY=leaked\n")
+    workdir = tmp_path / "tasks" / "t1"
+    workdir.mkdir(parents=True)
+    env = engine.build_env(task_id="t1", request_id="r", source=dict(os.environ))
+    probe = ("import json, os; from apodex.userenv import load_environment; load_environment(); "
+             "print(json.dumps({k: os.environ.get(k) for k in ('SERVICE_API_TOKEN', 'LANGFUSE_SECRET_KEY')}))")
+    out = subprocess.run([sys.executable, "-c", probe], cwd=workdir, env=env,
+                         capture_output=True, text=True, timeout=60, check=True)
+    assert json.loads(out.stdout.strip().splitlines()[-1]) == {
+        "SERVICE_API_TOKEN": None, "LANGFUSE_SECRET_KEY": None}
+
+
+def test_create_app_refuses_without_token_unless_allowed(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.delenv("SERVICE_ALLOW_NO_AUTH", raising=False)
+    cfg = ServiceConfig(data_dir=tmp_path, api_token="", max_concurrency=1, task_timeout_s=10,
+                        cancel_grace_s=1, default_mode="react", max_task_chars=10)
+    with pytest.raises(RuntimeError):
+        create_app(cfg)
+    create_app(cfg, allow_no_auth=True)
+    # An app factory does not know its bind address: no fake-IP passthrough.
+    monkeypatch.setenv("SERVICE_ALLOW_FAKE_IP", "1")
+    assert ServiceConfig.from_env().allow_fake_ip is False
+
+
+def test_is_our_worker_recognises_a_real_worker(tmp_path: Path) -> None:
+    import subprocess
+
+    from agent_service.runner import _is_our_worker
+
+    workdir = tmp_path / "tasks" / "abc"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--cwd", str(workdir)])
+    try:
+        time.sleep(0.3)
+        assert _is_our_worker(proc.pid, workdir) is True
+        assert _is_our_worker(proc.pid, tmp_path / "tasks" / "ab") is False   # no prefix match
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_restart_keeps_a_task_the_worker_finished(tmp_path: Path, client) -> None:
+    import asyncio
+
+    task_id = client.post("/v1/tasks", json={"task": "done before restart"}).json()["id"]
+    _wait(client, task_id)
+    store = client.app.state.store
+    store.update(task_id, status="running", pid=2 ** 22 + 99, error_code=None)   # service died mid-task
+    asyncio.run(client.app.state.runner._recover_after_restart())
+    assert store.get(task_id)["status"] == "completed"
+
+
+# -- shutdown, restart and export ordering (runner driven directly) ------------
+
+STUBBORN_WORKER = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(300)"
+# Counts SIGINTs and needs 1.5s of clean-up after the first, like a real
+# worker journaling run.end and deliverables.
+COUNTING_WORKER = r'''
+import signal, sys, time
+from pathlib import Path
+workdir = Path(sys.argv[1])
+count = 0
+def on_int(*_):
+    global count
+    count += 1
+    (workdir / "sigints").write_text(str(count))
+signal.signal(signal.SIGINT, on_int)
+(workdir / "ready").write_text("1")
+done_at = None
+while True:
+    time.sleep(0.05)
+    if count and done_at is None:
+        done_at = time.monotonic() + 1.5
+    if done_at and time.monotonic() > done_at:
+        sys.exit(0)
+'''
+
+
+def _runner(tmp_path: Path, monkeypatch, *, shutdown_grace_s: int = 25, script: str = FAKE_WORKER):
+    from agent_service.runner import Runner
+    from agent_service.store import TaskStore
+
+    worker = tmp_path / "worker.py"
+    worker.write_text(script, encoding="utf-8")
+    monkeypatch.setattr(engine, "build_command", lambda *, task, mode, workdir, max_turns:
+                        [sys.executable, str(worker), str(workdir), task, "--cwd", str(workdir), "--"])
+    cfg = ServiceConfig(data_dir=tmp_path / "svc", api_token="t", max_concurrency=1, task_timeout_s=120,
+                        cancel_grace_s=60, default_mode="react", max_task_chars=1000,
+                        shutdown_grace_s=shutdown_grace_s)
+    store = TaskStore(cfg.db_path)
+    return Runner(store, cfg), store, cfg
+
+
+def _add(store, cfg, task: str) -> str:
+    row, _ = store.create(task=task, mode="react", request_id=None, max_turns=None, workdir_root=cfg.tasks_root)
+    return row["id"]
+
+
+async def _until(store, task_id: str, status: str, timeout: float = 20) -> None:
+    import asyncio
+
+    deadline = time.monotonic() + timeout
+    while store.get(task_id)["status"] != status:
+        assert time.monotonic() < deadline, store.get(task_id)
+        await asyncio.sleep(0.1)
+
+
+async def test_shutdown_keeps_reason_and_starts_nothing_new(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from agent_service.runner import _alive
+
+    runner, store, cfg = _runner(tmp_path, monkeypatch, shutdown_grace_s=10)
+    await runner.start()
+    running, waiting = _add(store, cfg, "sleep a"), _add(store, cfg, "sleep b")
+    runner.submit(running)
+    runner.submit(waiting)
+    await _until(store, running, "running")
+    await asyncio.sleep(1.0)                     # let the worker open its journal
+    await runner.stop()
+    await asyncio.sleep(0.5)                     # a worker would pick up the next task here
+    row = store.get(running)
+    assert (row["status"], row["error_code"]) == ("cancelled", "service_shutdown")
+    queued = store.get(waiting)
+    assert queued["status"] == "queued" and queued["pid"] is None
+    assert not _alive(row["pid"])
+
+
+async def test_shutdown_cuts_a_slow_cancel_short(tmp_path: Path, monkeypatch) -> None:
+    from agent_service.runner import _alive
+
+    runner, store, cfg = _runner(tmp_path, monkeypatch, shutdown_grace_s=4, script=STUBBORN_WORKER)
+    await runner.start()
+    task_id = _add(store, cfg, "x")
+    runner.submit(task_id)
+    await _until(store, task_id, "running")
+    await runner.cancel(task_id)                 # 60s cancel grace; the worker ignores SIGINT
+    started = time.monotonic()
+    await runner.stop()
+    assert time.monotonic() - started < cfg.shutdown_grace_s + 1
+    assert not _alive(store.get(task_id)["pid"])
+
+
+async def _wait_for_file(path: Path, timeout: float = 10) -> None:
+    import asyncio
+
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        await asyncio.sleep(0.05)
+
+
+async def test_shutdown_never_interrupts_a_worker_twice(tmp_path: Path, monkeypatch) -> None:
+    """A second SIGINT would make the worker's asyncio.run raise
+    KeyboardInterrupt in the middle of writing run.end."""
+    runner, store, cfg = _runner(tmp_path, monkeypatch, shutdown_grace_s=10, script=COUNTING_WORKER)
+    await runner.start()
+    task_id = _add(store, cfg, "x")
+    runner.submit(task_id)
+    workdir = Path(store.get(task_id)["workdir"])
+    await _wait_for_file(workdir / "ready")
+    await runner.cancel(task_id)
+    await _wait_for_file(workdir / "sigints")    # the cancel's SIGINT arrived; clean-up runs
+    await runner.stop()                          # replaces the cancel's termination
+    assert (workdir / "sigints").read_text() == "1"
+    row = store.get(task_id)
+    assert (row["status"], row["error_code"], row["exit_code"]) == ("cancelled", "cancelled", 0)
+
+
+async def test_shutdown_stops_a_worker_that_was_still_spawning(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    import signal
+
+    from agent_service.runner import _alive
+
+    runner, store, cfg = _runner(tmp_path, monkeypatch, shutdown_grace_s=10, script=STUBBORN_WORKER)
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+    in_flight = asyncio.Event()
+
+    async def slow_spawn(*args, **kwargs):
+        proc = await real_spawn(*args, **kwargs)
+        spawned.append(proc)
+        in_flight.set()
+        await asyncio.sleep(0.5)                 # forked, not yet handed back to the runner
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_spawn)
+    await runner.start()
+    task_id = _add(store, cfg, "x")
+    runner.submit(task_id)
+    await in_flight.wait()
+    try:
+        await runner.stop()
+        assert not _alive(spawned[0].pid)
+        row = store.get(task_id)
+        assert (row["status"], row["pid"]) == ("queued", None)   # runs again after the restart
+    finally:
+        if spawned and spawned[0].returncode is None:
+            os.killpg(spawned[0].pid, signal.SIGKILL)
+
+
+async def test_restart_picks_up_rows_however_old(tmp_path: Path, monkeypatch) -> None:
+    import sqlite3
+
+    runner, store, cfg = _runner(tmp_path, monkeypatch)
+    first, second = _add(store, cfg, "q1"), _add(store, cfg, "q2")
+    unexported = _add(store, cfg, "e")
+    store.update(unexported, status="completed", exported=0)
+    # Many newer finished tasks in front of them.
+    with sqlite3.connect(cfg.db_path) as con:
+        con.executemany(
+            "INSERT INTO tasks (id, request_id, mode, task, status, created_at, workdir) "
+            "VALUES (?, ?, 'react', 't', 'completed', ?, '/nonexistent')",
+            [(f"f{i}", f"f{i}", f"2999-01-01T00:00:00.{i:06d}") for i in range(10_001)],
+        )
+    await runner._recover_after_restart()
+    assert [runner._queue.get_nowait(), runner._queue.get_nowait()] == [first, second]
+    assert runner._queue.empty()
+    assert unexported in runner._export_backlog
+
+
+async def test_restart_keeps_the_reason_a_task_was_being_stopped_for(tmp_path: Path, monkeypatch) -> None:
+    runner, store, cfg = _runner(tmp_path, monkeypatch)
+    ids = {}
+    for code in ("service_shutdown", "cancelled", "timeout"):
+        ids[code] = _add(store, cfg, code)
+        store.update(ids[code], status="cancelling", error_code=code, pid=2 ** 22 + 77)
+    await runner._recover_after_restart()
+    got = {code: (store.get(i)["status"], store.get(i)["error_code"]) for code, i in ids.items()}
+    assert got == {"service_shutdown": ("cancelled", "service_shutdown"),
+                   "cancelled": ("cancelled", "cancelled"), "timeout": ("timed_out", "timeout")}
+
+
+async def test_restart_survives_an_unreadable_journal(tmp_path: Path, monkeypatch) -> None:
+    runner, store, cfg = _runner(tmp_path, monkeypatch)
+    bad, queued = _add(store, cfg, "bad"), _add(store, cfg, "next")
+    rd = Path(store.get(bad)["workdir"]) / ".apodex" / "runs" / "s1"
+    rd.mkdir(parents=True)
+    (rd / "journal.db").write_bytes(b"not a database" * 100)
+    store.update(bad, status="running", pid=2 ** 22 + 78)
+    await runner._recover_after_restart()
+    row = store.get(bad)
+    assert (row["status"], row["error_code"]) == ("failed", "service_restart")
+    assert runner._queue.get_nowait() == queued
+
+
+async def test_final_state_does_not_wait_for_langfuse(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+
+    from agent_service import runner as runner_mod
+
+    async def slow_export(workdir, exporters, *, final):
+        await asyncio.sleep(30)
+        return False
+
+    monkeypatch.setattr(runner_mod, "_export_once", slow_export)
+    runner, store, cfg = _runner(tmp_path, monkeypatch)
+    await runner.start()
+    task_id = _add(store, cfg, "quick")
+    runner.submit(task_id)
+    await _until(store, task_id, "completed", timeout=15)
+    assert store.get(task_id)["exported"] == 0
+    await runner.stop()
+    # The owed export survives a restart.
+    again, _, _ = _runner(tmp_path, monkeypatch)
+    await again._recover_after_restart()
+    assert task_id in again._export_backlog
+
+
+def test_classify_keeps_the_shutdown_reason() -> None:
+    from agent_service.runner import _classify
+
+    crashed = engine.RunResult(status="cancelled")
+    row = {"status": "cancelling", "error_code": "service_shutdown"}
+    assert _classify(crashed, 130, row, forced=None, timed_out=False) == ("cancelled", "service_shutdown")
+
+
+def test_is_our_worker_handles_paths_with_spaces(tmp_path: Path) -> None:
+    import subprocess
+
+    from agent_service.runner import _is_our_worker
+
+    workdir = tmp_path / "data dir" / "tasks" / "abc"
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", "--cwd", str(workdir), "--", "t"])
+    try:
+        time.sleep(0.3)
+        assert _is_our_worker(proc.pid, workdir) is True
+        assert _is_our_worker(proc.pid, tmp_path / "data dir" / "tasks" / "ab") is False
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_default_data_dir_needs_a_home(monkeypatch) -> None:
+    from agent_service import config
+
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: (_ for _ in ()).throw(RuntimeError("no home"))))
+    with pytest.raises(RuntimeError, match="SERVICE_DATA_DIR"):
+        config._default_data_dir()

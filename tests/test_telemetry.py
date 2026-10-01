@@ -424,3 +424,116 @@ def test_fake_ip_optin_is_limited_to_the_proxy_range(monkeypatch) -> None:
 
     monkeypatch.setenv("FRONTIER_AGENT_ALLOW_FAKE_IP_CIDRS", "0.0.0.0/0, 10.0.0.0/8, nonsense, 198.18.0.0/15")
     assert [str(n) for n in _local_fake_ip_networks()] == ["198.18.0.0/15"]
+
+
+async def test_tool_span_waits_for_the_tail_before_export(tmp_path: Path) -> None:
+    run = await _one_turn_run(tmp_path, finish=False)
+    obs_entries = _entries(run)
+    builder = lf.SpanBuilder(tmp_path)
+    builder.feed(obs_entries)
+    # simulate tool.result arriving; agent has not moved on yet
+    agent_span = next(e["span_id"] for e in obs_entries if e["kind"] == "loop.start")
+    tool_span = next(e["span_id"] for e in obs_entries if e["kind"] == "tool.call")
+    base = {"trace_id": run.trace_id, "seq": 99, "agent_id": "a", "turn": 1}
+    builder.feed([{**base, "entry_id": "x1", "kind": "tool.result", "ts": obs_entries[-1]["ts"],
+                   "span_id": tool_span, "parent_span_id": agent_span, "data": {"result": "raw"}}])
+    assert not any(s.name.startswith("tool:") for s in builder.take(set(), final=False))
+    builder.feed([{**base, "entry_id": "x2", "kind": "tool.result.final", "ts": obs_entries[-1]["ts"],
+                   "span_id": tool_span, "parent_span_id": agent_span, "data": {"result": "seen"}},
+                  {**base, "entry_id": "x3", "kind": "turn.end", "ts": obs_entries[-1]["ts"],
+                   "span_id": agent_span, "parent_span_id": run.root_span_id, "data": {}}])
+    tool = next(s for s in builder.take(set(), final=False) if s.name.startswith("tool:"))
+    assert tool.attrs["langfuse.observation.output"] == "seen"
+
+
+async def test_unconfirmed_inflight_waits_out_the_grace_period(tmp_path: Path, monkeypatch) -> None:
+    import time as _time
+
+    ex = lf.Exporter(tmp_path, "s", "r")
+    sent: set[str] = set()
+
+    async def none_arrived(client, trace_id):
+        return set()
+
+    monkeypatch.setattr(lf, "_existing_ids", none_arrived)
+    now = _time.time()
+    keep = await ex._reconcile(None, sent, {"a": ["id-a", now - 5], "b": ["id-b", now - 1000]}, now)
+    assert set(keep) == {"a"} and not sent          # a waits, b is released for resend
+
+    async def failing(client, trace_id):
+        raise OSError("langfuse down")
+
+    monkeypatch.setattr(lf, "_existing_ids", failing)
+    keep = await ex._reconcile(None, sent, {"a": ["id-a", now - 5]}, now)
+    assert set(keep) == {"a"}                        # a failing check never blocks or drops
+
+
+async def test_snapshot_failure_does_not_fail_the_task(tmp_path: Path, monkeypatch) -> None:
+    def boom(_):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(TelemetryRun, "snapshot_outputs", staticmethod(boom))
+    async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t", outputs_dir=tmp_path / "out") as run:
+        pass
+    end = _entries(run)[-1]["data"]
+    assert end["status"] == "completed" and end["complete"] is False
+    assert run._heartbeat is None
+
+
+async def test_cancel_while_opening_still_closes_the_run(tmp_path: Path, monkeypatch) -> None:
+    """A cancel landing anywhere around run.start never leaves the lease
+    renewed or the run without run.end."""
+    import time
+
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    started: list[TelemetryRun] = []
+    real_start = TelemetryRun.start
+
+    async def start(self, **kw):
+        started.append(self)
+        await real_start(self, **kw)
+        await asyncio.sleep(1)               # cancel lands right after run.start
+
+    monkeypatch.setattr(TelemetryRun, "start", start)
+
+    async def body():
+        async with telemetry_run(run_dir=tmp_path, session_id="s1", task="t", outputs_dir=outputs):
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(body())
+    deadline = time.monotonic() + 5
+    while not started:
+        assert time.monotonic() < deadline
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    run = started[0]
+    assert run._heartbeat is None
+    assert _entries(run)[-1]["kind"] == "run.end"
+    assert _entries(run)[-1]["data"]["status"] == "cancelled"
+
+
+async def test_live_owner_on_this_host_keeps_its_run_after_the_lease(tmp_path: Path) -> None:
+    import os
+    import subprocess
+    import sys
+
+    from frontier_agent.telemetry.run import LEASE_TIMEOUT_S, _proc_start_marker, recover_stale
+
+    await _one_turn_run(tmp_path, finish=False)
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        lock = tmp_path / "run.lock"
+        info = json.loads(lock.read_text())
+        info.update(pid=owner.pid, pid_started=_proc_start_marker(owner.pid))
+        lock.write_text(json.dumps(info))
+        old = lock.stat().st_mtime - LEASE_TIMEOUT_S - 5
+        os.utime(lock, (old, old))
+        assert await recover_stale(tmp_path) is None      # slow to close, not dead
+    finally:
+        owner.kill()
+        owner.wait()
+    assert await recover_stale(tmp_path) is not None

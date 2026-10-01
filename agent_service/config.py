@@ -2,13 +2,33 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
+# Default data directory before it moved out of the working tree.
+_LEGACY_DATA_DIR = Path(".service")
+
 
 def is_loopback(host: str) -> bool:
     return host in ("127.0.0.1", "::1", "localhost")
+
+
+def _default_data_dir() -> Path:
+    """Outside any project tree, so no project .env sits above task dirs."""
+    base = os.getenv("XDG_DATA_HOME")
+    if not base:
+        try:
+            base = str(Path.home() / ".local" / "share")
+        except RuntimeError as exc:   # no HOME and no passwd entry (arbitrary container uid)
+            raise RuntimeError("cannot determine a home directory; set SERVICE_DATA_DIR") from exc
+    if (_LEGACY_DATA_DIR / "service.db").exists():
+        logger.warning("found tasks in %s, the old default data directory; they are not used. "
+                       "Set SERVICE_DATA_DIR=%s to keep using them",
+                       _LEGACY_DATA_DIR.resolve(), _LEGACY_DATA_DIR.resolve())
+    return Path(base) / "frontier-agent" / "service"
 
 
 def _int(name: str, default: int) -> int:
@@ -26,6 +46,9 @@ class ServiceConfig:
     default_mode: str
     max_task_chars: int
     host: str = "127.0.0.1"
+    # Total budget for stopping running workers on shutdown; keep it below
+    # the orchestrator's grace period (K8S default 30s).
+    shutdown_grace_s: int = 25
     # Pass the local-proxy fake-IP opt-in to workers. Only honoured for a
     # loopback-bound service with SERVICE_ALLOW_FAKE_IP=1 (local development).
     allow_fake_ip: bool = False
@@ -53,11 +76,15 @@ class ServiceConfig:
         return self.data_dir / "service.db"
 
     @classmethod
-    def from_env(cls, host: str = "127.0.0.1") -> ServiceConfig:
+    def from_env(cls, host: str | None = None) -> ServiceConfig:
+        """*host* is the address actually bound; unknown (``None``, e.g. an
+        app factory) is treated as non-loopback."""
         return cls(
-            host=host,
-            allow_fake_ip=is_loopback(host) and os.getenv("SERVICE_ALLOW_FAKE_IP", "") == "1",
-            data_dir=Path(os.getenv("SERVICE_DATA_DIR", ".service")).expanduser().resolve(),
+            host=host or "",
+            allow_fake_ip=bool(host) and is_loopback(host or "")
+            and os.getenv("SERVICE_ALLOW_FAKE_IP", "") == "1",
+            shutdown_grace_s=_int("SERVICE_SHUTDOWN_GRACE_S", 25),
+            data_dir=Path(os.getenv("SERVICE_DATA_DIR") or _default_data_dir()).expanduser().resolve(),
             api_token=os.getenv("SERVICE_API_TOKEN", "").strip(),
             max_concurrency=max(1, _int("SERVICE_MAX_CONCURRENCY", 2)),
             task_timeout_s=_int("SERVICE_TASK_TIMEOUT_S", 7200),

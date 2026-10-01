@@ -272,7 +272,11 @@ def load_environment() -> EnvResolution:
         load_dotenv = None  # type: ignore[assignment]
         find_dotenv = None  # type: ignore[assignment]
 
-    if load_dotenv is not None and find_dotenv is not None:
+    # Hosts that hand the process a curated environment (agent_service
+    # workers) opt out of the cwd/parent .env search, which would otherwise
+    # re-import whatever the nearest project .env holds.
+    no_dotenv = os.environ.get("APODEX_NO_DOTENV", "").strip() == "1"
+    if load_dotenv is not None and find_dotenv is not None and not no_dotenv:
         local = Path.cwd() / ".env"
         candidates: list[Path] = []
         if local.is_file():

@@ -245,12 +245,16 @@ class TaskRunnerMixin:
 
     async def run_task(self, task: str) -> None:
         from apodex.run_layout import run_dir
-        from frontier_agent.telemetry.scope import telemetry_run
 
         # Nested run_task calls (steering, compaction resume) join the outer
-        # run, and the latest outcome is the run's outcome.
-        self.last_outcome = ("completed", "")
-        self.last_answer = ""
+        # run; only the outermost call resets the outcome, so a failure in an
+        # earlier step is not masked by a later one.
+        from frontier_agent.telemetry.run import current_run
+        from frontier_agent.telemetry.scope import telemetry_run
+
+        if current_run.get() is None:
+            self.last_outcome = ("completed", "")
+            self.last_answer = ""
         async with telemetry_run(
             run_dir=run_dir(self.session_id),
             session_id=self.session_id,
@@ -264,7 +268,11 @@ class TaskRunnerMixin:
                 run.set_answer(self.last_answer)
 
     def _outcome(self, status: str, error: str = "") -> None:
-        """Record how the task really ended; ``run_task`` reports it."""
+        """Record how the task really ended; ``run_task`` reports it. A
+        failure is sticky: a later step cannot turn it back into success."""
+        prev = getattr(self, "last_outcome", ("completed", ""))[0]
+        if prev in ("failed", "cancelled") and status not in ("failed", "cancelled"):
+            return
         self.last_outcome = (status, error)
 
     async def _run_task(self, task: str) -> None:
@@ -624,7 +632,11 @@ class TaskRunnerMixin:
             if "tool_calls_count" in state
             else 0
         )
-        self.last_answer = final
+        if final.startswith("(the workflow finished without"):
+            # Placeholder prose, not an answer: never report it upstream.
+            self._outcome("incomplete", "workflow finished without a final answer")
+        else:
+            self.last_answer = final
         if not complete:
             self._outcome("incomplete", f"stopped_by={stopped_by}; answer_status={state.get('answer_status') or ''}")
         if complete:

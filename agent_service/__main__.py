@@ -29,7 +29,10 @@ def main() -> None:
     if not cfg.loopback and not cfg.api_token:
         # Workers run with every tool auto-approved; never expose that unauthenticated.
         raise SystemExit(f"refusing to listen on {a.host} without SERVICE_API_TOKEN")
-    uvicorn.run(create_app(cfg), host=a.host, port=a.port, log_level="info")
+    app = create_app(cfg, allow_no_auth=cfg.loopback)
+    # Bound the wait for open (SSE) connections so lifespan shutdown, which
+    # stops the workers, runs inside the orchestrator's grace period.
+    uvicorn.run(app, host=a.host, port=a.port, log_level="info", timeout_graceful_shutdown=3)
 
 
 if __name__ == "__main__":
