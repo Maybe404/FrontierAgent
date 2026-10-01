@@ -265,6 +265,27 @@ def test_restart_keeps_a_task_the_worker_finished(tmp_path: Path, client) -> Non
 # -- shutdown, restart and export ordering (runner driven directly) ------------
 
 STUBBORN_WORKER = "import signal, time; signal.signal(signal.SIGINT, signal.SIG_IGN); time.sleep(300)"
+# Counts SIGINTs and needs 1.5s of clean-up after the first, like a real
+# worker journaling run.end and deliverables.
+COUNTING_WORKER = r'''
+import signal, sys, time
+from pathlib import Path
+workdir = Path(sys.argv[1])
+count = 0
+def on_int(*_):
+    global count
+    count += 1
+    (workdir / "sigints").write_text(str(count))
+signal.signal(signal.SIGINT, on_int)
+(workdir / "ready").write_text("1")
+done_at = None
+while True:
+    time.sleep(0.05)
+    if count and done_at is None:
+        done_at = time.monotonic() + 1.5
+    if done_at and time.monotonic() > done_at:
+        sys.exit(0)
+'''
 
 
 def _runner(tmp_path: Path, monkeypatch, *, shutdown_grace_s: int = 25, script: str = FAKE_WORKER):
@@ -330,6 +351,85 @@ async def test_shutdown_cuts_a_slow_cancel_short(tmp_path: Path, monkeypatch) ->
     await runner.stop()
     assert time.monotonic() - started < cfg.shutdown_grace_s + 1
     assert not _alive(store.get(task_id)["pid"])
+
+
+async def _wait_for_file(path: Path, timeout: float = 10) -> None:
+    import asyncio
+
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"{path} never appeared"
+        await asyncio.sleep(0.05)
+
+
+async def test_shutdown_never_interrupts_a_worker_twice(tmp_path: Path, monkeypatch) -> None:
+    """A second SIGINT would make the worker's asyncio.run raise
+    KeyboardInterrupt in the middle of writing run.end."""
+    runner, store, cfg = _runner(tmp_path, monkeypatch, shutdown_grace_s=10, script=COUNTING_WORKER)
+    await runner.start()
+    task_id = _add(store, cfg, "x")
+    runner.submit(task_id)
+    workdir = Path(store.get(task_id)["workdir"])
+    await _wait_for_file(workdir / "ready")
+    await runner.cancel(task_id)
+    await _wait_for_file(workdir / "sigints")    # the cancel's SIGINT arrived; clean-up runs
+    await runner.stop()                          # replaces the cancel's termination
+    assert (workdir / "sigints").read_text() == "1"
+    row = store.get(task_id)
+    assert (row["status"], row["error_code"], row["exit_code"]) == ("cancelled", "cancelled", 0)
+
+
+async def test_shutdown_stops_a_worker_that_was_still_spawning(tmp_path: Path, monkeypatch) -> None:
+    import asyncio
+    import signal
+
+    from agent_service.runner import _alive
+
+    runner, store, cfg = _runner(tmp_path, monkeypatch, shutdown_grace_s=10, script=STUBBORN_WORKER)
+    real_spawn = asyncio.create_subprocess_exec
+    spawned: list[asyncio.subprocess.Process] = []
+    in_flight = asyncio.Event()
+
+    async def slow_spawn(*args, **kwargs):
+        proc = await real_spawn(*args, **kwargs)
+        spawned.append(proc)
+        in_flight.set()
+        await asyncio.sleep(0.5)                 # forked, not yet handed back to the runner
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", slow_spawn)
+    await runner.start()
+    task_id = _add(store, cfg, "x")
+    runner.submit(task_id)
+    await in_flight.wait()
+    try:
+        await runner.stop()
+        assert not _alive(spawned[0].pid)
+        row = store.get(task_id)
+        assert (row["status"], row["pid"]) == ("queued", None)   # runs again after the restart
+    finally:
+        if spawned and spawned[0].returncode is None:
+            os.killpg(spawned[0].pid, signal.SIGKILL)
+
+
+async def test_restart_picks_up_rows_however_old(tmp_path: Path, monkeypatch) -> None:
+    import sqlite3
+
+    runner, store, cfg = _runner(tmp_path, monkeypatch)
+    first, second = _add(store, cfg, "q1"), _add(store, cfg, "q2")
+    unexported = _add(store, cfg, "e")
+    store.update(unexported, status="completed", exported=0)
+    # Many newer finished tasks in front of them.
+    with sqlite3.connect(cfg.db_path) as con:
+        con.executemany(
+            "INSERT INTO tasks (id, request_id, mode, task, status, created_at, workdir) "
+            "VALUES (?, ?, 'react', 't', 'completed', ?, '/nonexistent')",
+            [(f"f{i}", f"f{i}", f"2999-01-01T00:00:00.{i:06d}") for i in range(10_001)],
+        )
+    await runner._recover_after_restart()
+    assert [runner._queue.get_nowait(), runner._queue.get_nowait()] == [first, second]
+    assert runner._queue.empty()
+    assert unexported in runner._export_backlog
 
 
 async def test_restart_keeps_the_reason_a_task_was_being_stopped_for(tmp_path: Path, monkeypatch) -> None:

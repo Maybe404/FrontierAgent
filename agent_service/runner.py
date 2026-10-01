@@ -42,6 +42,10 @@ class Runner:
         self._procs: dict[str, asyncio.subprocess.Process] = {}
         self._workers: list[asyncio.Task[None]] = []
         self._terminations: dict[str, asyncio.Task[None]] = {}
+        # Pids already sent SIGINT, so a replaced termination never sends another.
+        self._interrupted: set[int] = set()
+        # Tasks between dequeue and their worker landing in ``_procs``.
+        self._spawning: set[str] = set()
         self._stopping = False
         # Tasks whose final Langfuse export is still owed; retried by the
         # sweeper. Persisted as ``exported=0`` so a restart picks them up.
@@ -65,7 +69,7 @@ class Runner:
         deadline = loop.time() + self.cfg.shutdown_grace_s
         shut: set[str] = set()
         # Re-scan while waiting: a worker may have been spawning when stop began.
-        while self._procs and loop.time() < deadline:
+        while (self._procs or self._spawning) and loop.time() < deadline:
             for task_id in list(self._procs):
                 if task_id not in shut and self._shutdown_task(task_id, deadline - loop.time()):
                     shut.add(task_id)
@@ -98,7 +102,7 @@ class Runner:
         """Rows left running by a dead service are failed (their worker is
         stopped if it is verifiably still ours); queued rows run again. One
         unreadable task never blocks startup."""
-        for row in self.store.list(limit=10_000):
+        for row in self.store.unfinished():
             if row["status"] in ("running", "cancelling"):
                 try:
                     await self._recover_row(row)
@@ -184,6 +188,7 @@ class Runner:
         env = engine.build_env(task_id=task_id, request_id=row["request_id"],
                                allow_fake_ip=self.cfg.allow_fake_ip)
         log = (workdir / "worker.log").open("ab")
+        self._spawning.add(task_id)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd, cwd=str(workdir), env=env, stdin=asyncio.subprocess.DEVNULL,
@@ -191,8 +196,14 @@ class Runner:
             )
         finally:
             log.close()
+            self._spawning.discard(task_id)
         self._procs[task_id] = proc
         try:
+            if self._stopping:
+                # Shutdown began while it was spawning: stop the worker before
+                # it does anything; the task stays queued for the next start.
+                await self._terminate(proc, grace=0)
+                return
             if not self.store.transition(task_id, ("queued",), "running", started_at=now(), pid=proc.pid):
                 await self._terminate(proc)        # cancelled between dequeue and start
                 await self._finish(task_id, workdir, exit_code=proc.returncode,
@@ -216,6 +227,7 @@ class Runner:
             await self._finish(task_id, workdir, exit_code=proc.returncode, timed_out=timed_out)
         finally:
             self._procs.pop(task_id, None)
+            self._interrupted.discard(proc.pid)
 
     async def _terminate(self, proc: asyncio.subprocess.Process, *, grace: float | None = None) -> None:
         """SIGINT (graceful: the CLI stops at a turn boundary and journals
@@ -224,8 +236,14 @@ class Runner:
         for sig, wait in ((signal.SIGINT, first), (signal.SIGTERM, 5), (signal.SIGKILL, 2)):
             if proc.returncode is not None:
                 return
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(proc.pid, sig)
+            # A second SIGINT makes the worker's asyncio.run raise
+            # KeyboardInterrupt mid clean-up (run.end, deliverables); a worker
+            # already interrupted is only given the time to finish.
+            if not (sig == signal.SIGINT and proc.pid in self._interrupted):
+                if sig == signal.SIGINT:
+                    self._interrupted.add(proc.pid)
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(proc.pid, sig)
             with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(proc.wait(), timeout=wait)
 

@@ -58,6 +58,9 @@ class TaskStore:
                     except sqlite3.OperationalError as exc:   # another instance won the race
                         if "duplicate column" not in str(exc):
                             raise
+            # After the migrations: on an old database ``exported`` only exists now.
+            con.execute("CREATE INDEX IF NOT EXISTS idx_tasks_unexported ON tasks(exported) "
+                        "WHERE exported = 0")
 
     def _connect(self) -> sqlite3.Connection:
         con = sqlite3.connect(self.path, timeout=30)
@@ -110,6 +113,18 @@ class TaskStore:
         params.append(limit)
         with closing(self._connect()) as con:
             return [r for r in (_row(x) for x in con.execute(sql, params).fetchall()) if r]
+
+    def unfinished(self) -> list[dict[str, Any]]:
+        """Every row a restart must pick up, however old: active rows and
+        finished rows whose Langfuse export is still owed. Oldest first, so
+        queued tasks are re-queued in submission order."""
+        marks = ",".join("?" for _ in ACTIVE)
+        with closing(self._connect()) as con:
+            rows = con.execute(
+                f"SELECT * FROM tasks WHERE status IN ({marks}) OR exported = 0 ORDER BY created_at",
+                ACTIVE,
+            ).fetchall()
+        return [r for r in (_row(x) for x in rows) if r]
 
     def update(self, task_id: str, **fields: Any) -> None:
         if "deliverables" in fields:
