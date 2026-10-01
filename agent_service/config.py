@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+# Default data directory before it moved out of the working tree.
+_LEGACY_DATA_DIR = Path(".service")
 
 
 def is_loopback(host: str) -> bool:
@@ -13,7 +18,16 @@ def is_loopback(host: str) -> bool:
 
 def _default_data_dir() -> Path:
     """Outside any project tree, so no project .env sits above task dirs."""
-    base = os.getenv("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    base = os.getenv("XDG_DATA_HOME")
+    if not base:
+        try:
+            base = str(Path.home() / ".local" / "share")
+        except RuntimeError as exc:   # no HOME and no passwd entry (arbitrary container uid)
+            raise RuntimeError("cannot determine a home directory; set SERVICE_DATA_DIR") from exc
+    if (_LEGACY_DATA_DIR / "service.db").exists():
+        logger.warning("found tasks in %s, the old default data directory; they are not used. "
+                       "Set SERVICE_DATA_DIR=%s to keep using them",
+                       _LEGACY_DATA_DIR.resolve(), _LEGACY_DATA_DIR.resolve())
     return Path(base) / "frontier-agent" / "service"
 
 

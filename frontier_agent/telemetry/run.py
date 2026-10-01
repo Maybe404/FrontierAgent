@@ -352,8 +352,15 @@ async def recover_stale(run_dir: Path) -> str | None:
     except (OSError, ValueError):
         return None
     same_host = info.get("host") == socket.gethostname()
-    owner_dead = same_host and not _same_process_alive(
-        int(info.get("pid", 0)), info.get("pid_started"))
+    pid, started = int(info.get("pid", 0)), info.get("pid_started")
+    owner_alive = same_host and _same_process_alive(pid, started)
+    # A same-host owner verified alive (pid and start marker match) may be
+    # slow to close, e.g. still journaling deliverables; never steal its run.
+    # Our own pid is the exception: a run we still hold the lock of but are
+    # not running any more was abandoned.
+    if owner_alive and started and pid != os.getpid():
+        return None
+    owner_dead = same_host and not owner_alive
     # Other hosts (shared volume) are judged only by the heartbeat lease.
     if not owner_dead and age < LEASE_TIMEOUT_S:
         return None

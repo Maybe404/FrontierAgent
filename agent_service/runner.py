@@ -43,8 +43,10 @@ class Runner:
         self._workers: list[asyncio.Task[None]] = []
         self._terminations: dict[str, asyncio.Task[None]] = {}
         self._stopping = False
-        # Workdirs whose final Langfuse export failed; retried by the sweeper.
-        self._export_backlog: set[Path] = set()
+        # Tasks whose final Langfuse export is still owed; retried by the
+        # sweeper. Persisted as ``exported=0`` so a restart picks them up.
+        self._export_backlog: dict[str, Path] = {}
+        self._exports: set[asyncio.Task[None]] = set()
         self._sweeper: asyncio.Task[None] | None = None
 
     # -- lifecycle --------------------------------------------------------------
@@ -56,42 +58,82 @@ class Runner:
 
     async def stop(self) -> None:
         """Stop workers within ``shutdown_grace_s`` in total. Tasks stopped
-        here end ``cancelled``/``service_shutdown`` so callers can resubmit."""
+        here end ``cancelled``/``service_shutdown`` so callers can resubmit;
+        queued tasks stay queued and run after the restart."""
         self._stopping = True
         loop = asyncio.get_running_loop()
         deadline = loop.time() + self.cfg.shutdown_grace_s
-        for task_id in list(self._procs):
-            if self.store.transition(task_id, ("running",), "cancelling",
-                                     error="service shutdown", error_code="service_shutdown"):
-                self._start_termination(task_id, grace=max(1, self.cfg.shutdown_grace_s - 8))
+        shut: set[str] = set()
+        # Re-scan while waiting: a worker may have been spawning when stop began.
         while self._procs and loop.time() < deadline:
+            for task_id in list(self._procs):
+                if task_id not in shut and self._shutdown_task(task_id, deadline - loop.time()):
+                    shut.add(task_id)
             await asyncio.sleep(0.1)
-        for t in (*self._workers, *([self._sweeper] if self._sweeper else [])):
+        for task_id, proc in list(self._procs.items()):
+            if proc.returncode is not None:
+                continue                # exited; only its bookkeeping is pending
+            logger.warning("task %s: worker still running at shutdown deadline; killing it", task_id)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(proc.pid, signal.SIGKILL)
+        for t in (*self._workers, *self._exports, *([self._sweeper] if self._sweeper else [])):
             t.cancel()
+
+    def _shutdown_task(self, task_id: str, remaining: float) -> bool:
+        """Terminate *task_id* within *remaining* seconds (SIGINT wait plus
+        the SIGTERM/SIGKILL steps). False while its row is not yet running."""
+        if not self.store.transition(task_id, ("running",), "cancelling",
+                                     error="service shutdown", error_code="service_shutdown"):
+            row = self.store.get(task_id) or {}
+            if row.get("status") != "cancelling":
+                return row.get("status") not in ("queued", "running")
+        # A cancel already in progress has the long cancel grace; replace it.
+        old = self._terminations.pop(task_id, None)
+        if old is not None:
+            old.cancel()
+        self._start_termination(task_id, grace=max(0.0, remaining - 8))
+        return True
 
     async def _recover_after_restart(self) -> None:
         """Rows left running by a dead service are failed (their worker is
-        stopped if it is verifiably still ours); queued rows run again."""
+        stopped if it is verifiably still ours); queued rows run again. One
+        unreadable task never blocks startup."""
         for row in self.store.list(limit=10_000):
             if row["status"] in ("running", "cancelling"):
-                workdir = Path(row["workdir"])
-                pid = row.get("pid")
-                if pid:
-                    owned = await asyncio.to_thread(_is_our_worker, pid, workdir)
-                    if owned:
-                        await _kill_group_and_wait(pid)
-                    elif owned is None:
-                        logger.warning("task %s: cannot verify pid %s (no /proc or ps); not signalling it",
-                                       row["id"], pid)
-                # A worker that outlived the old service may have finished the
-                # task; the journal decides before any forced status.
-                done = engine.read_result(workdir).status == "completed"
-                code = "cancelled" if row["status"] == "cancelling" else "service_restart"
-                await self._finish(row["id"], workdir, exit_code=0 if done else None,
-                                   forced=None if done else ("cancelled" if code == "cancelled" else "failed", code),
-                                   note="" if done else "service restarted while task was running")
+                try:
+                    await self._recover_row(row)
+                except Exception:
+                    logger.exception("task %s: recovery failed; closing it without its journal", row["id"])
+                    status, code = _classify(engine.RunResult(), None, row, timed_out=False,
+                                             forced=None if row["status"] == "cancelling"
+                                             else ("failed", "service_restart"))
+                    self.store.transition(row["id"], ("running", "cancelling"), status, finished_at=now(),
+                                          error=row.get("error") or "service restarted; task journal unreadable",
+                                          error_code=code)
             elif row["status"] == "queued":
                 self._queue.put_nowait(row["id"])
+            elif row.get("exported") == 0:
+                self._export_backlog[row["id"]] = Path(row["workdir"])
+
+    async def _recover_row(self, row: dict[str, Any]) -> None:
+        workdir = Path(row["workdir"])
+        pid = row.get("pid")
+        if pid:
+            owned = await asyncio.to_thread(_is_our_worker, pid, workdir)
+            if owned:
+                await _kill_group_and_wait(pid)
+            elif owned is None:
+                logger.warning("task %s: cannot verify pid %s (no /proc or ps); not signalling it",
+                               row["id"], pid)
+        # A worker that outlived the old service may have finished the task;
+        # the journal decides before any forced status. A cancelling row keeps
+        # the reason it was being stopped for (caller, timeout, shutdown).
+        done = engine.read_result(workdir).status == "completed"
+        if done or row["status"] == "cancelling":
+            await self._finish(row["id"], workdir, exit_code=0 if done else None)
+        else:
+            await self._finish(row["id"], workdir, exit_code=None, forced=("failed", "service_restart"),
+                               note="service restarted while task was running")
 
     # -- api ---------------------------------------------------------------------
 
@@ -111,7 +153,9 @@ class Runner:
         if proc is not None and task_id not in self._terminations:
             t = asyncio.create_task(self._terminate(proc, grace=grace))
             self._terminations[task_id] = t
-            t.add_done_callback(lambda _t, k=task_id: self._terminations.pop(k, None))
+            # Only drop our own entry: shutdown may have replaced it.
+            t.add_done_callback(lambda t, k=task_id: self._terminations.get(k) is t
+                                and self._terminations.pop(k))
 
     # -- execution ---------------------------------------------------------------
 
@@ -128,6 +172,8 @@ class Runner:
                 self._queue.task_done()
 
     async def _run(self, task_id: str) -> None:
+        if self._stopping:
+            return                      # stays queued; the next start runs it
         row = self.store.get(task_id)
         if row is None or row["status"] != "queued":
             return                      # cancelled while queued, or already handled
@@ -199,17 +245,21 @@ class Runner:
         """Retry final exports that failed (Langfuse down at task end)."""
         while True:
             await asyncio.sleep(_EXPORT_RETRY_S)
-            for workdir in list(self._export_backlog):
-                if await _export_once(workdir, {}, final=True):
-                    self._export_backlog.discard(workdir)
+            for task_id, workdir in list(self._export_backlog.items()):
+                await self._export_final(task_id, workdir)
+
+    async def _export_final(self, task_id: str, workdir: Path) -> None:
+        if await _export_once(workdir, {}, final=True):
+            self._export_backlog.pop(task_id, None)
+            self.store.update(task_id, exported=1)
+        else:
+            self._export_backlog[task_id] = workdir
 
     async def _finish(self, task_id: str, workdir: Path, *, exit_code: int | None,
                       forced: tuple[str, str] | None = None, timed_out: bool = False,
                       note: str = "") -> None:
         await engine.recover(workdir)            # crashed worker -> synthetic run.end
         result = engine.read_result(workdir)
-        if not await _export_once(workdir, {}, final=True):
-            self._export_backlog.add(workdir)
         row = self.store.get(task_id) or {}
         status, code = _classify(result, exit_code, row, forced=forced, timed_out=timed_out)
         error = None
@@ -220,21 +270,31 @@ class Runner:
             task_id, ("queued", "running", "cancelling"), status,
             finished_at=now(), exit_code=exit_code, answer=result.answer, error=error,
             error_code=code, complete=int(result.complete), deliverables=result.deliverables,
+            exported=0,
         )
         logger.info("task %s finished: %s/%s (exit %s)%s", task_id, status, code, exit_code,
                     "" if done else " [already final, not overwritten]")
+        # Export after the final state is written, so a slow or unreachable
+        # Langfuse never delays the task's result.
+        if done:
+            t = asyncio.create_task(self._export_final(task_id, workdir))
+            self._exports.add(t)
+            t.add_done_callback(self._exports.discard)
 
 
 def _classify(result: engine.RunResult, exit_code: int | None, row: dict[str, Any], *,
               forced: tuple[str, str] | None, timed_out: bool) -> tuple[str, str | None]:
-    """``(status, error_code)``. A run that completed wins over a late cancel."""
+    """``(status, error_code)``. A run that completed wins over a late cancel;
+    a stopped run keeps the reason it was stopped for."""
     if forced:
         return forced
     if exit_code == 0 and result.status == "completed":
         return "completed", None
     if timed_out or row.get("error_code") == "timeout":
         return "timed_out", "timeout"
-    if row.get("status") == "cancelling" or result.status == "cancelled":
+    if row.get("status") == "cancelling":
+        return "cancelled", row.get("error_code") or "cancelled"
+    if result.status == "cancelled":
         return "cancelled", "cancelled"
     if result.status == "crashed" or not result.status:
         return "failed", "worker_crashed"
@@ -268,9 +328,10 @@ async def _export_once(workdir: Path, exporters: dict[str, Any], *, final: bool)
     return ok
 
 
-def _cmdline(pid: int) -> list[str] | None:
-    """Argument vector of *pid*: /proc on Linux, else ``ps -ww``.
-    ``[]`` when the process is gone, ``None`` when it cannot be determined."""
+def _cmdline(pid: int) -> list[str] | str | None:
+    """Command line of *pid*: the exact argument vector from /proc on Linux,
+    else the space-joined ``ps -ww`` string (argument boundaries are lost).
+    Empty when the process is gone, ``None`` when it cannot be determined."""
     proc = Path(f"/proc/{pid}/cmdline")
     if Path("/proc/self/cmdline").exists():
         try:
@@ -282,7 +343,7 @@ def _cmdline(pid: int) -> list[str] | None:
                              capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return None
-    return out.stdout.split() if out.returncode == 0 else []
+    return out.stdout.strip() if out.returncode == 0 else ""
 
 
 def _is_our_worker(pid: int, workdir: Path) -> bool | None:
@@ -293,6 +354,10 @@ def _is_our_worker(pid: int, workdir: Path) -> bool | None:
     if argv is None:
         return None
     target = str(workdir)
+    if isinstance(argv, str):
+        # The worker always has more arguments after --cwd, so the path is
+        # followed by a space; this also matches paths that contain spaces.
+        return f" --cwd {target} " in f" {argv} "
     return any(a == "--cwd" and b == target for a, b in itertools.pairwise(argv))
 
 

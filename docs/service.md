@@ -34,7 +34,7 @@ SERVICE_API_TOKEN=... uv run python -m agent_service --host 127.0.0.1 --port 880
 | Variable | Default | Meaning |
 |---|---|---|
 | `SERVICE_API_TOKEN` | — | required `Authorization: Bearer <token>`; the app refuses to start without it unless bound to loopback via `python -m agent_service` or `SERVICE_ALLOW_NO_AUTH=1` |
-| `SERVICE_DATA_DIR` | `$XDG_DATA_HOME/frontier-agent/service` (`~/.local/share/...`) | task db and per-task working directories; keep it outside any project tree |
+| `SERVICE_DATA_DIR` | `$XDG_DATA_HOME/frontier-agent/service` (`~/.local/share/...`) | task db and per-task working directories; keep it outside any project tree. Set it in containers (a volume path): without `HOME` the default cannot be resolved and the service refuses to start. Earlier builds defaulted to `./.service`; if that exists a warning says how to keep using it |
 | `SERVICE_SHUTDOWN_GRACE_S` | `25` | total time to stop running workers on shutdown (keep below the orchestrator's grace period) |
 | `SERVICE_MAX_CONCURRENCY` | `2` | tasks running at once; the rest queue |
 | `SERVICE_TASK_TIMEOUT_S` | `7200` | hard limit per task |
@@ -91,6 +91,6 @@ journal.
 | worker exits non-zero or without `run.end` | task `failed` (`worker_crashed`, or the run's own reason); journal gets a synthetic `run.end` (`crashed`) |
 | agent ends with an LLM error or an incomplete answer | CLI exits non-zero; task `failed` with `llm_error` / `incomplete` |
 | timeout | SIGINT → grace → SIGTERM → SIGKILL; task `timed_out` |
-| service shutdown | running workers get SIGINT and are awaited within `SERVICE_SHUTDOWN_GRACE_S`; tasks end `cancelled` / `service_shutdown`; open SSE streams are closed |
-| service restarts | a task whose journal shows it completed stays `completed`; other rows left `running` become `failed` (`service_restart`). A leftover worker is signalled only if its `--cwd` argument is exactly that task's workdir (read from `/proc`, else `ps -ww`); if identity cannot be verified it is left alone and a warning is logged. `queued` rows run again |
-| Langfuse unavailable at task end | the final export is retried every 60s until it succeeds |
+| service shutdown | no new task starts; running workers (including ones already being cancelled) get SIGINT, then SIGTERM/SIGKILL, all within `SERVICE_SHUTDOWN_GRACE_S`; a worker still alive at the deadline is killed. Stopped tasks end `cancelled` / `service_shutdown` (a task already being cancelled or timed out keeps that reason); `queued` tasks stay queued and run after the restart; open SSE streams are closed |
+| service restarts | a task whose journal shows it completed stays `completed`; other rows left `running` become `failed` (`service_restart`); rows left `cancelling` become `cancelled` (or `timed_out`) with the reason they were being stopped for, e.g. `service_shutdown`. A task whose journal cannot be read is closed the same way without blocking startup. A leftover worker is signalled only if its `--cwd` argument is exactly that task's workdir (read from `/proc`, else `ps -ww`); if identity cannot be verified it is left alone and a warning is logged. `queued` rows run again |
+| Langfuse unavailable at task end | the task's final state is written first; the export runs afterwards and is retried every 60s until it succeeds, also after a service restart |

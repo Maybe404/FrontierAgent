@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     error TEXT,
     error_code TEXT,
     complete INTEGER,
-    deliverables_json TEXT
+    deliverables_json TEXT,
+    exported INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
 """
@@ -36,7 +37,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status, created_at);
 ACTIVE = ("queued", "running", "cancelling")
 FINAL = ("completed", "failed", "cancelled", "timed_out")
 # Columns added after the first release; created on open if missing.
-_MIGRATIONS = {"error_code": "TEXT"}
+_MIGRATIONS = {"error_code": "TEXT", "exported": "INTEGER"}
 
 
 def now() -> str:

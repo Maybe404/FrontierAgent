@@ -37,18 +37,26 @@ async def telemetry_run(
         if recovered:
             logger.warning("telemetry: closed run %s left open by a dead process", recovered)
     run = TelemetryRun(run_dir, session_id=session_id, workflow=workflow)
-    try:
-        await run.start(task=task, config=config)
-    except Exception:
-        logger.exception("telemetry: could not start run journal; continuing without it")
-        yield None
-        return
+    # Snapshot before the run opens: from run.start to the try below there
+    # must be no await, or a cancel there would leave the run unclosed.
     before = None
     if outputs_dir is not None:
         try:
             before = await asyncio.to_thread(TelemetryRun.snapshot_outputs, Path(outputs_dir))
         except Exception as exc:     # never fail the task over a snapshot
             run.note_failure("outputs snapshot", exc)
+    try:
+        await run.start(task=task, config=config)
+    except asyncio.CancelledError:
+        run.stop_heartbeat()
+        with contextlib.suppress(Exception):
+            await asyncio.shield(run.end(status="cancelled"))
+        raise
+    except Exception:
+        run.stop_heartbeat()
+        logger.exception("telemetry: could not start run journal; continuing without it")
+        yield None
+        return
     token = current_run.set(run)
     status, error = "completed", ""
     exporter = _start_exporter(run)
