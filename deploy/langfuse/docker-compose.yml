@@ -1,7 +1,8 @@
 # FrontierAgent local Langfuse. Derived from docker-compose.upstream.yml
 # (langfuse/langfuse main, v4 images); diff against it when upgrading.
 # Changes: fixed project name, only web (3100) and object storage (9190) are
-# published and only on 127.0.0.1, telemetry off, secrets from ./.env.
+# published, on 127.0.0.1 unless LANGFUSE_BIND says otherwise, telemetry off,
+# secrets from ./.env.
 #   docker compose up -d            # start
 #   docker compose down             # stop, keep data
 #   docker compose down -v          # remove everything, including data
@@ -112,7 +113,7 @@ services:
     restart: always
     depends_on: *langfuse-depends-on
     ports:
-      - 127.0.0.1:${LANGFUSE_WEB_PORT:-3100}:3000
+      - ${LANGFUSE_BIND:-127.0.0.1}:${LANGFUSE_WEB_PORT:-3100}:3000
     environment:
       <<: *langfuse-worker-env
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret} # CHANGEME
@@ -163,7 +164,7 @@ services:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minio}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-miniosecret} # CHANGEME
     ports:
-      - 127.0.0.1:${LANGFUSE_S3_PORT:-9190}:9000
+      - ${LANGFUSE_BIND:-127.0.0.1}:${LANGFUSE_S3_PORT:-9190}:9000
     volumes:
       - langfuse_minio_data:/data
     healthcheck:
