@@ -399,6 +399,16 @@ def _build_tool_env(
     # mode has no inner namespace). Measured on 4 concurrent sub-agents writing
     # ``/tmp/scratch.csv``: all four read back the last writer's content.
     projected["TMPDIR"] = tmpdir
+    # Name this run's directories for model-authored commands. Projected from
+    # the trusted state rather than inherited, so a stale ``OUTPUT_DIR`` from
+    # the harness environment cannot point a command at a previous session's
+    # directory; the explicit ``tmpdir`` argument still wins, since the caller
+    # may own a private scratch root the state does not know about.
+    from plugins.tools._filesystem_state import current_filesystem_state
+
+    for key, value in current_filesystem_state().shell_env().items():
+        if key != "TMPDIR":
+            projected[key] = value
     # Keep pip/matplotlib/caches inside a HOME the tool user owns. Without
     # these they target root-owned paths and fail with bare permission errors
     # the model cannot act on.
@@ -831,15 +841,20 @@ _BWRAP_PATH = shutil.which("bwrap")
 _BWRAP_USABLE: bool | None = None
 
 
-def bwrap_available() -> bool:
-    """True on Linux when ``bwrap`` is present and usable."""
-    global _BWRAP_USABLE
+def bwrap_probe() -> tuple[bool, str]:
+    """``(usable, why_not)`` for bubblewrap on this host, uncached.
+
+    Public so a test can report WHY the jail is unavailable instead of
+    re-probing with its own arguments. A hand-written probe is a trap here:
+    ``bwrap --ro-bind / / true`` fails on a perfectly working host, because
+    without ``--unshare-user`` bwrap needs to be setuid and the packaged binary
+    is not. Only the argument set the sandbox actually runs answers the
+    question the caller is asking.
+    """
     if not sys.platform.startswith("linux"):
-        return False
+        return False, f"not Linux (platform={sys.platform})"
     if _BWRAP_PATH is None:
-        return False
-    if _BWRAP_USABLE is not None:
-        return _BWRAP_USABLE
+        return False, "no bwrap binary on PATH"
     try:
         result = subprocess.run(
             [_BWRAP_PATH, *_bwrap_base_args(), "--", "true"],
@@ -847,12 +862,22 @@ def bwrap_available() -> bool:
             text=True,
             timeout=5,
         )
-        _BWRAP_USABLE = result.returncode == 0
-        if not _BWRAP_USABLE:
-            logger.warning("bubblewrap probe failed: %s", result.stderr.strip())
     except Exception as exc:
-        logger.warning("bubblewrap probe failed: %s", exc)
-        _BWRAP_USABLE = False
+        return False, f"probe raised {type(exc).__name__}: {exc}"
+    if result.returncode == 0:
+        return True, ""
+    return False, result.stderr.strip() or f"probe exit {result.returncode}"
+
+
+def bwrap_available() -> bool:
+    """True on Linux when ``bwrap`` is present and usable."""
+    global _BWRAP_USABLE
+    if _BWRAP_USABLE is not None:
+        return _BWRAP_USABLE
+    usable, why_not = bwrap_probe()
+    _BWRAP_USABLE = usable
+    if not usable and _BWRAP_PATH is not None and sys.platform.startswith("linux"):
+        logger.warning("bubblewrap probe failed: %s", why_not)
     return _BWRAP_USABLE
 
 
@@ -863,11 +888,6 @@ def bwrap_available() -> bool:
 # ``_venv_bind_args``. ``/proc`` is deliberately NOT here — see ``--proc`` below.
 _BWRAP_SYSTEM_PATHS = ("/usr", "/bin", "/lib", "/lib64", "/etc")
 
-# Recovery store below the workspace. Kept in sync with ``_overflow``'s
-# ``_WORKSPACE_SUBDIR`` by name rather than by import: ``_overflow`` imports this
-# module (lazily, from inside its functions), so a module-level import back the
-# other way would be a cycle.
-_SPILL_SUBDIR = ".spill"
 
 
 def _interpreter_bind_args() -> list[str]:
@@ -1008,6 +1028,27 @@ def _bwrap_mem_limit_mb() -> int:
     return _mem_limit_mb("sandbox_bwrap_mem_mb", "SANDBOX_BWRAP_MEM_MB", 12 * 1024)
 
 
+def _spill_mount_args() -> list[str]:
+    """Mount the CURRENT scope's spill stores read-only under ``/spill``.
+
+    Resolved per command, not when the jail is built: one jail (the shared
+    singleton, a pool lease, the container's inner jail) serves many agents, and
+    each must see only its own store and its sub-agents' — the same set
+    ``_path_auth`` authorizes, from the same scope key the writer used.
+
+    Read-only because model commands run as uid 0 inside the user namespace, so
+    file modes are not consulted; a mount is. The harness writes spill through
+    the host filesystem, so this constrains model commands only.
+    """
+    try:
+        from plugins.tools._overflow import spill_bind_args
+
+        return spill_bind_args()
+    except Exception as exc:
+        logger.warning("spill mount unavailable for this command: %s", exc)
+        return []
+
+
 class _BwrapCommands:
     """Command executor that wraps each command in a bubblewrap sandbox."""
 
@@ -1043,6 +1084,7 @@ class _BwrapCommands:
             _BWRAP_PATH,
             *base_args,
             *self._bind_args,
+            *_spill_mount_args(),
             "--chdir",
             self._chdir,
             "--",
@@ -1172,32 +1214,6 @@ class BwrapSandbox:
                 (["--ro-bind"] if read_only else ["--bind"])
                 + [str(src_path), str(dst)]
             )
-
-        # Mount the spill store read-only at its own top-level path.
-        #
-        # Without a mount the read-only store is only a lexical promise:
-        # ``_deliverable_policy`` refuses every natural way to write there —
-        # including bash, which IS token-scanned — but shell expansion can hide a
-        # path from any scanner (a glob, a brace, a ``$VAR`` assembled in pieces,
-        # a ``$(…)`` substitution), and the files are ordinary 0644 files. File
-        # modes cannot close it either — model commands run as uid 0 inside the
-        # user namespace, so DAC is not consulted. A mount is, which is why this
-        # is the layer that actually holds.
-        #
-        # This no longer has to be the LAST bind to win: the source now sits
-        # outside the workspace, so nothing above it overlaps and the ordering
-        # constraint that used to be load-bearing is gone.
-        #
-        # ``--ro-bind-try``, not ``--ro-bind``: the store is created lazily on the
-        # first spill, and bwrap aborts the whole jail when a ``--ro-bind`` source
-        # is missing. Args are rebuilt per command, so the mount appears as soon
-        # as the directory does — and until then there is nothing to protect.
-        #
-        # The harness writes spill through the host filesystem, not through the
-        # jail, so this constrains model commands only.
-        bind_args.extend([
-            "--ro-bind-try", str(spill_root()), _DEFAULT_SPILL_DIR,
-        ])
 
         self._workdir = str(workspace_path)
         self._tmpdir = str(tmp_path)
@@ -2338,17 +2354,16 @@ def resolve_sandbox_mode(agent_cfg: dict[str, Any] | None = None) -> str:
 
 
 def resolve_mount_dirs() -> tuple[str, str, str]:
-    """Return ``(workspace_dir, outputs_dir, inputs_dir)`` for container mode.
+    """Return ``(workspace_dir, outputs_dir, inputs_dir)`` for this run.
 
-    Defaults to the production mount points ``/workspace``, ``/outputs``,
-    ``/inputs``; each is overridable via ``FRONTIER_AGENT_WORKSPACE_DIR`` /
-    ``FRONTIER_AGENT_OUTPUTS_DIR`` / ``FRONTIER_AGENT_INPUTS_DIR`` so a local run
-    (no root) can point them at repo-relative dirs.
+    Now a thin read of :mod:`plugins.tools._filesystem_state`, which is the one
+    place these are derived (from the same ``FRONTIER_AGENT_*_DIR`` overrides
+    when no state is installed). Kept as a function because every existing
+    caller asks for exactly this triple.
     """
-    ws = os.environ.get("FRONTIER_AGENT_WORKSPACE_DIR", "").strip() or _DEFAULT_WORKSPACE_DIR
-    out = os.environ.get("FRONTIER_AGENT_OUTPUTS_DIR", "").strip() or _DEFAULT_OUTPUTS_DIR
-    inp = os.environ.get("FRONTIER_AGENT_INPUTS_DIR", "").strip() or _DEFAULT_INPUTS_DIR
-    return ws, out, inp
+    from plugins.tools._filesystem_state import current_filesystem_state
+
+    return current_filesystem_state().dirs()
 
 
 def spill_root() -> Path:
@@ -2365,18 +2380,53 @@ def spill_root() -> Path:
     """
     explicit = os.environ.get(_SPILL_DIR_ENV, "").strip()
     if explicit:
-        return Path(explicit)
+        return _refuse_symlinked_spill_root(Path(explicit))
     run_dir = os.environ.get("APODEX_RUN_DIR", "").strip()
     if run_dir:
-        return Path(run_dir) / "spill"
+        return _refuse_symlinked_spill_root(Path(run_dir) / "spill")
     # The uid is in the NAME so two accounts on one host do not share a store.
     # It is not a permission boundary and cannot be: under ``container`` the
     # model runs as a DIFFERENT uid than the harness and has to read these
     # files, so the directory must stay traversable by others (0755). What keeps
-    # one conversation out of another's recovery files is ``_path_auth``, which
-    # authorizes only the current scope plus the stores this process created —
-    # a local user with their own shell is outside that model either way.
-    return Path(tempfile.gettempdir()) / f"apodex-spill-{os.getuid()}"
+    # one conversation out of another's recovery files is the scope key
+    # (``_overflow.current_store_scope``): bwrap mounts only that scope's store
+    # and its sub-agents', and ``_path_auth`` authorizes the same set.
+    #
+    # KNOWN LIMITATION — ``container`` without the inner bwrap jail: every
+    # agent's commands run as the same unprivileged tool uid with no mount
+    # namespace, so a model command can ``cat`` any scope under this root.
+    # File modes cannot separate agents that share a uid; closing it needs the
+    # inner jail (``FRONTIER_AGENT_CONTAINER_INNER_BWRAP``). In-process file
+    # tools are still scope-checked by ``_path_auth``.
+    return _refuse_symlinked_spill_root(
+        Path(tempfile.gettempdir()) / f"apodex-spill-{os.getuid()}",
+    )
+
+
+_private_spill_root: Path | None = None
+_private_spill_lock = threading.Lock()
+
+
+def _refuse_symlinked_spill_root(path: Path) -> Path:
+    """``path``, unless it is a symlink — then one private temp directory.
+
+    Every user of the root resolves it, so a symlink planted at a shared
+    location (``/tmp/apodex-spill-<uid>``) would redirect the store, the
+    ``/spill`` mount and read authorization to wherever it points. Falling back
+    to a private directory keeps spill working instead of failing the run; it is
+    created once so the writer, the mount and the reader still agree.
+    """
+    global _private_spill_root
+    if not path.is_symlink():
+        return path
+    with _private_spill_lock:
+        if _private_spill_root is None:
+            _private_spill_root = Path(tempfile.mkdtemp(prefix="apodex-spill-"))
+            logger.warning(
+                "spill root %s is a symlink; using private %s instead",
+                path, _private_spill_root,
+            )
+        return _private_spill_root
 
 
 def is_spill_path(path: str) -> bool:
@@ -2974,6 +3024,22 @@ def shell_quote(s: str) -> str:
     return "'" + s.replace("'", "'\\''") + "'"
 
 
+def _local_write_refusal(path: str) -> str:
+    """Why the path gate refuses writing ``path`` on this host, or "".
+
+    Only consulted for the in-process write branch below. Imported lazily:
+    ``_path_auth`` imports this module.
+    """
+    try:
+        from plugins.tools._path_auth import _is_path_allowed
+    except Exception as exc:  # pragma: no cover - broken install
+        return f"path authorization unavailable: {exc}"
+    allowed, reason = _is_path_allowed(path, write_access=True)
+    if allowed:
+        return ""
+    return reason or f"write to {path!r} is not authorized"
+
+
 def sandbox_write_file(
     sandbox: Any, path: str, content: str, *, mode: str = "w",
 ) -> tuple[bool, str]:
@@ -2995,9 +3061,19 @@ def sandbox_write_file(
     # (128 KB), so routing deliverables through it fails with E2BIG somewhere
     # around 96 KB of content — and container mode has no /tmp fallback, so the
     # write becomes a hard error. The harness process already has the mount
-    # bound read-write and the path has passed ``_path_auth``; writing it
-    # directly is both unlimited and cheaper (no bwrap + python3 spawn).
+    # bound read-write, so writing it directly is both unlimited and cheaper
+    # (no bwrap + python3 spawn).
+    #
+    # This branch is an ordinary ``open()`` in the harness process — as root, in
+    # container mode — so it is NOT a sandbox boundary, and the path has to be
+    # authorized HERE. Its callers (``write_file``, ``file_editor_create``)
+    # reach the sandbox precisely when ``_path_auth`` refused a local write, and
+    # for a CurrentSandbox that made the refusal a detour rather than a denial:
+    # a path the gate rejected was written to the host anyway.
     if isinstance(sandbox, CurrentSandbox):
+        reason = _local_write_refusal(path)
+        if reason:
+            return False, reason
         try:
             p = Path(path)
             new_parent = not p.parent.exists()
@@ -3025,7 +3101,7 @@ def sandbox_write_file(
     if mode == "w" and isinstance(sandbox, DockerSandbox):
         parent = os.path.dirname(path)
         if parent:
-            sandbox.commands.run(f"mkdir -p {parent}", timeout=10)
+            sandbox.commands.run(f"mkdir -p {shell_quote(parent)}", timeout=10)
         with tempfile.NamedTemporaryFile(
             mode="w", encoding="utf-8", delete=False, suffix=".tmp",
         ) as f:

@@ -58,7 +58,9 @@ from frontier_agent.core.runtime.loop.tiered_compact import (
     compaction_trigger_tokens,
 )
 from frontier_agent.core.runtime.loop.tool_exec import ToolResultPostProcessor
+from frontier_agent.infra.config import get_config
 from frontier_agent.state.event_store.sqlite import EventStore
+from plugins.tools._filesystem_state import current_filesystem_state
 from plugins.tools.bash import BASH_STDERR_SEPARATOR
 from workflows.agent_team.identity import MAIN_AGENT_ID, SUB_ROLE_ID, llm_session_id
 from workflows.agent_team.stream_repetition import StreamRepetitionConfig
@@ -78,18 +80,12 @@ def render_sandbox_fs_note(
     """Render truthful filesystem context for the active sandbox topology."""
     shared = sandbox_mode in ("container", "native")
     location = "this native workspace" if sandbox_mode == "native" else "this container"
-    workspace_path = (
-        os.environ.get("FRONTIER_AGENT_WORKSPACE_DIR", "the workspace")
-        if sandbox_mode == "native" else "/workspace"
-    )
-    inputs_path = (
-        os.environ.get("FRONTIER_AGENT_INPUTS_DIR", "the inputs directory")
-        if sandbox_mode == "native" else "/inputs"
-    )
-    outputs_path = (
-        os.environ.get("FRONTIER_AGENT_OUTPUTS_DIR", "the outputs directory")
-        if sandbox_mode == "native" else "/outputs"
-    )
+    # The prompt names exactly the directories the file tools authorize and the
+    # shell variables point at, because all of them read this one state. Read
+    # from the environment per mode, these three could disagree with the tools:
+    # a relocated outputs directory outside native mode left the prompt saying
+    # ``/outputs`` while every writer used the override.
+    workspace_path, outputs_path, inputs_path = current_filesystem_state().dirs()
     project_path = os.environ.get("FRONTIER_AGENT_PROJECT_DIR", "").strip()
     if audience == "sub":
         workspace = (
@@ -746,13 +742,6 @@ class SwarmToolResultPostProcessor(ToolResultPostProcessor):
     })
 
     _BUDGETS: ClassVar[dict[str, int]] = {
-        "bash": 4_000,
-        "run_python_code": 5_000,
-        # Gate ① overflows these to disk at meta.max_result_chars=8K and puts the
-        # "saved to <path>, use read_file" pointer at the TAIL. The 6K default cut
-        # below that and took the pointer with it, leaving a truncated result with
-        # no way back to the rest. 10K leaves the 8K body and its footer room to
-        # both survive — the value react has carried for this reason all along.
         "grep_search": 10_000,
         "glob_search": 10_000,
         # Belt-and-suspenders: collect_reports is whitelisted above (pass-
@@ -761,6 +750,17 @@ class SwarmToolResultPostProcessor(ToolResultPostProcessor):
         # TOOL_RESULT_MAX_CHARS ceiling) rather than falling back to 6K.
         "collect_reports": 150_000,
     }
+    # bash / run_python_code overflow to disk at gate ①, which is configurable
+    # via TOOL_EXEC_RESULT_MAX_CHARS, and they carry two things worth keeping:
+    # the "saved to <path>, use read_file" pointer and the exit status, both of
+    # which live at the tail. Gate ② must therefore track gate ① — a deployment
+    # that raises the exec cap to give long scans more room would otherwise have
+    # gate ② cut the extra room straight back off, and a deployment that raises
+    # it above the fixed 6K default would lose the recovery path entirely. Same
+    # rule, same headroom, as the React processor in
+    # workflows.stateful_react_agent._runtime.
+    _CONFIGURED_EXEC_TOOLS = frozenset({"bash", "run_python_code"})
+    _EXEC_FOOTER_HEADROOM = 2_000
     _BUDGET_DEFAULT = 6_000
 
     _BASH_STDERR_KEEP = 3_000
@@ -782,7 +782,15 @@ class SwarmToolResultPostProcessor(ToolResultPostProcessor):
         if name in self._PASS_THROUGH:
             return content
 
-        budget = self._BUDGETS.get(name, self._BUDGET_DEFAULT)
+        if name in self._CONFIGURED_EXEC_TOOLS:
+            # Gate ① is configurable. Gate ② must track it or a deployment
+            # raising TOOL_EXEC_RESULT_MAX_CHARS can lose the overflow pointer.
+            budget = (
+                get_config().tool_exec_result_max_chars
+                + self._EXEC_FOOTER_HEADROOM
+            )
+        else:
+            budget = self._BUDGETS.get(name, self._BUDGET_DEFAULT)
         if name == "bash":
             return self._compact_bash(content, budget)
         return self._head_cap(content, budget)
@@ -1117,7 +1125,7 @@ def build_swarm_session_runtime_spec(
     # is already reset by then and the list has to be handed over explicitly.
     _denials: dict[str, list[tuple[str, str]]] = {}
     _tiered = runtime.context_compaction == "tiered" and runtime.max_len > 0
-    from plugins.tools._overflow import spill_compacted_body
+    from plugins.tools._overflow import default_compaction_spill
 
     def _config(_job_id: str, item: SubTask, max_turns: int) -> LoopConfig:
         if _tiered:
@@ -1127,7 +1135,7 @@ def build_swarm_session_runtime_spec(
                 summary_llm=runtime.sub_agent_llm,
                 relief_target=int(runtime.max_len * 0.6),
                 gauge=gauge,  # calibrate relief to real tokens (unit-match trigger)
-                spill=spill_compacted_body if runtime.compaction_spill else None,
+                spill=default_compaction_spill() if runtime.compaction_spill else None,
                 summary_retry_timeout_s=(
                     runtime.sub_agent_llm_timeout or LoopConfig.llm_timeout
                 ),

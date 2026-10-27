@@ -149,6 +149,7 @@ OPENAI_BASE_URL=https://your-openai-compatible-endpoint/v1
 OPENAI_MODEL=your-model-name
 
 # Optional web research tools
+WEB_SEARCH_PROVIDER=serper
 SERPER_API_KEY=
 SERPER_BASE_URL=https://google.serper.dev
 JINA_API_KEY=
@@ -156,6 +157,14 @@ JINA_API_KEY=
 
 Support any Serper.dev-compatible endpoint (like litescrape.com, serpbase.dev,
 and others) by setting `SERPER_BASE_URL` and a provider-issued `SERPER_API_KEY`.
+
+Set `WEB_SEARCH_PROVIDER=parallel` to use the free, keyless
+[Parallel Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) for
+`web_search`. Serper remains the default, so existing keys and missing-key
+errors keep their current behavior. Parallel MCP does not support the tool's
+custom region, language, or time filters, or counts above 10 per query; choose
+Serper when those are needed.
+`web_fetch` continues to use its existing fetch provider.
 
 Start the TUI:
 
@@ -227,11 +236,14 @@ Chinese-speaking macOS users can use the
 ## Containers and local models
 
 Pre-built `linux/amd64` and `linux/arm64` images are published to the GitHub
-Container Registry, so no local Python environment is needed:
+Container Registry, so no local Python environment is needed. That package is
+private, so `docker login ghcr.io` (with an account authorized for it) is
+required — otherwise build the checkout:
 
 ```bash
 cp .env.example .env
-docker compose run --rm agent
+docker compose -f compose.yaml -f compose.dev.yaml build
+docker compose -f compose.yaml -f compose.dev.yaml run --rm agent
 ```
 
 - [Run FrontierAgent in Docker](docs/install/docker.md) — Compose, image

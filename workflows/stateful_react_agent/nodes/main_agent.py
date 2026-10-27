@@ -70,6 +70,11 @@ from frontier_agent.utils.language import (
     resolve_language,
 )
 from plugins.tools._bash_policy import reset_policy_mode, set_policy_mode
+from plugins.tools._filesystem_state import (
+    install_filesystem_state,
+    reset_filesystem_state,
+    state_for_sandbox_mode,
+)
 from plugins.tools._sandbox import (
     BwrapSandbox,
     SandboxUnavailableError,
@@ -849,6 +854,17 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     worktree_root.mkdir(parents=True, exist_ok=True)
     outputs_dir.mkdir(parents=True, exist_ok=True)
 
+    # Install this run's filesystem contract before anything can ask about a
+    # path. From here on the prompts, the shell variables, the file-tool
+    # permissions and the deliverable roots all read the SAME directories
+    # instead of each re-deriving them from the environment.
+    fs_token = install_filesystem_state(state_for_sandbox_mode(
+        sandbox_mode,
+        workspace=str(worktree_root),
+        outputs=str(outputs_dir),
+        inputs=inputs_dir,
+    ))
+
     # /inputs is an external bind-mount (Worker Shell syncs it from S3); the
     # harness never populates it. Log what actually landed there so a
     # missing/misplaced input file is diagnosable from the worker log.
@@ -1050,14 +1066,14 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
     if context_compaction == "tiered" and max_len > 0:
         gauge = InputTokenGauge()
         observers.append(gauge)
-        from plugins.tools._overflow import spill_compacted_body
+        from plugins.tools._overflow import default_compaction_spill
 
         compactor: Any = TieredCompactor(
             keep_tool_result=tier1_keep_tool_result,
             summary_llm=llm,
             relief_target=int(max_len * 0.6),
             gauge=gauge,  # calibrate relief to real tokens (unit-match trigger)
-            spill=spill_compacted_body if compaction_spill else None,
+            spill=default_compaction_spill() if compaction_spill else None,
             summary_retry_timeout_s=llm_timeout,
         )
         compaction_policy = InputTokenThresholdPolicy(
@@ -1120,11 +1136,20 @@ async def react_agent_node(state: dict[str, Any], ctx: NodeContext) -> dict[str,
         )
     finally:
         reset_policy_mode(policy_token)
+        reset_filesystem_state(fs_token)
         if sb_token is not None:
             clear_task_sandbox(sb_token)
         # Drop this run's task board (no-op when task_board is off) so boards
         # don't leak across trials in a long-lived worker process.
         clear_board(ctx.task_id)
+        # Same for its spilled tool results: finalization ran inside the loop,
+        # so nothing can name them any more. Only stores this process created
+        # under this run's scope are removed.
+        from plugins.tools._overflow import cleanup_overflow_tree, spill_scope_key
+
+        cleanup_overflow_tree(spill_scope_key(
+            ctx.task_id, str(metadata.get("session_id") or ctx.task_id),
+        ))
         kill = getattr(sandbox, "kill", None)
         if callable(kill):
             kill()
